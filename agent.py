@@ -2,6 +2,9 @@ import os
 import psycopg2
 from groq import Groq
 from dotenv import load_dotenv
+from telegram import send_message
+from datetime import datetime, time
+import pytz
 
 load_dotenv()
 
@@ -44,11 +47,19 @@ def analyze(prompt):
     response = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}])
     return response.choices[0].message.content
 
+def is_market_open():
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    return time(9, 30) <= now.time() <= time(16, 0)
+
 if __name__ == "__main__":
+    if not is_market_open():
+        print("Market closed, exiting.")
+        exit(0)
     holdings = get_holdings()
     prompt = build_prompt(holdings)
     response = analyze(prompt)
     if response.strip() != "SILENT":
-        print(response)
-
-
+        send_message(response)
