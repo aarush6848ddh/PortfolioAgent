@@ -32,6 +32,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 DISCLAIMER = "\n\n---\nData analysis only — not financial advice."
