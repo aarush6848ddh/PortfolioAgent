@@ -12,7 +12,7 @@ All reasoning flows through the multi-agent orchestrator:
 import sys
 from portfolio import is_market_open, log_run
 from orchestrator import run_agents
-from telegram import send_message
+from tg_helpers import send_message
 
 
 def morning_briefing():

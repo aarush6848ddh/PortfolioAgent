@@ -26,7 +26,7 @@ from sentiment import get_fear_greed, format_fear_greed
 
 load_dotenv()
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3)
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3)
 
 # --- State ---
 
