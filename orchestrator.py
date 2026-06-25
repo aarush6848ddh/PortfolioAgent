@@ -40,6 +40,26 @@ load_dotenv()
 
 llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3)
 
+import time
+import logging
+
+log = logging.getLogger("orchestrator")
+
+def llm_invoke_with_retry(messages, max_retries=3):
+    """Call LLM with retry on rate limit errors."""
+    for attempt in range(max_retries):
+        try:
+            return llm.invoke(messages)
+        except Exception as e:
+            if "429" in str(e) or "rate_limit" in str(e).lower():
+                wait = 10 * (attempt + 1)
+                log.warning(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                raise
+    return llm.invoke(messages)  # final attempt, let it raise
+
+
 # --- State ---
 
 def merge_str(existing: str, new: str) -> str:
@@ -280,7 +300,7 @@ OVERNIGHT_SENTIMENT: X/10
 
 {intel_text}"""
 
-    response = llm.invoke([
+    response = llm_invoke_with_retry([
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=prompt),
     ])
@@ -309,7 +329,7 @@ Keep it factual and concise. Do NOT give investment advice.
 
 {quant_text}"""
 
-    response = llm.invoke([
+    response = llm_invoke_with_retry([
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=prompt),
     ])
@@ -318,6 +338,11 @@ Keep it factual and concise. Do NOT give investment advice.
 
 def bull_agent(state: AgentState) -> dict:
     """Makes the strongest bull case for the portfolio based on available data."""
+    # Truncate reports for bull/bear to stay within rate limits
+    data_short = state['data_report'][:1500]
+    news_short = state['news_report'][:1500]
+    quant_short = state['quant_report'][:1000]
+
     prompt = f"""You are a bull case analyst. Based on the data below, make the STRONGEST
 possible optimistic case for this portfolio over the next 1-3 months.
 
@@ -327,11 +352,11 @@ good quant metrics, positive earnings surprises, analyst upgrades, etc.
 Be specific and data-driven. No vague optimism — cite numbers from the reports.
 Keep it to 4-6 sentences.
 
-=== DATA === {state['data_report']}
-=== NEWS === {state['news_report']}
-=== QUANT === {state['quant_report']}"""
+=== DATA === {data_short}
+=== NEWS === {news_short}
+=== QUANT === {quant_short}"""
 
-    response = llm.invoke([
+    response = llm_invoke_with_retry([
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=prompt),
     ])
@@ -340,6 +365,10 @@ Keep it to 4-6 sentences.
 
 def bear_agent(state: AgentState) -> dict:
     """Makes the strongest bear case for the portfolio based on available data."""
+    data_short = state['data_report'][:1500]
+    news_short = state['news_report'][:1500]
+    quant_short = state['quant_report'][:1000]
+
     prompt = f"""You are a bear case analyst. Based on the data below, make the STRONGEST
 possible pessimistic case for this portfolio over the next 1-3 months.
 
@@ -349,11 +378,11 @@ concentration risk, poor earnings outlook, downgrades, macro headwinds, etc.
 Be specific and data-driven. No vague pessimism — cite numbers from the reports.
 Keep it to 4-6 sentences.
 
-=== DATA === {state['data_report']}
-=== NEWS === {state['news_report']}
-=== QUANT === {state['quant_report']}"""
+=== DATA === {data_short}
+=== NEWS === {news_short}
+=== QUANT === {quant_short}"""
 
-    response = llm.invoke([
+    response = llm_invoke_with_retry([
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=prompt),
     ])
@@ -472,7 +501,7 @@ After your response, add a final line starting with "TAKEAWAY:" followed by
 a single sentence summary of the most important insight from this briefing.
 This will be stored for future context."""
 
-    response = llm.invoke([
+    response = llm_invoke_with_retry([
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=prompt),
     ])
