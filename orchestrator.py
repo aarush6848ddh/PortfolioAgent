@@ -5,11 +5,9 @@ Four specialist agents run in parallel, then a synthesis agent combines their re
   [START] ──┬── data_agent ───┐
              ├── news_agent ───┼── synthesis_agent ── [END]
              └── quant_agent ──┘
-
-Each agent has a narrow scope and produces a structured report.
-The synthesis agent combines all reports with mode-specific instructions.
 """
 import os
+from datetime import datetime, timedelta, date
 from typing import TypedDict, Annotated
 from langgraph.graph import StateGraph, START, END
 from langchain_groq import ChatGroq
@@ -18,11 +16,22 @@ from dotenv import load_dotenv
 
 from portfolio import (
     get_holdings, get_finnhub_quote, get_prev_close, get_streak,
-    store_daily_close, get_conn, SYSTEM_PROMPT, sanitize_response
+    store_daily_close, get_conn, SYSTEM_PROMPT, sanitize_response,
+    get_alert_threshold, set_alert_threshold,
+    store_daily_snapshot, get_weekly_snapshots, get_last_week_snapshots,
+    get_yesterday_closes, get_total_contributions, ET,
 )
 from quant import get_quant_summary, format_quant_for_prompt
 from news import get_full_intel
-from sentiment import get_fear_greed, format_fear_greed
+from sentiment import (
+    get_fear_greed, format_fear_greed,
+    store_fear_greed, check_sustained_fear, get_avg_fear_greed,
+)
+from config import (
+    CONCENTRATION_BASE_PCT, CONCENTRATION_STEP_PCT,
+    BIG_MOVE_PCT, DRAWDOWN_ALERT_PCT,
+    INTRADAY_WORD_LIMIT, MORNING_WORD_LIMIT,
+)
 
 load_dotenv()
 
@@ -31,7 +40,6 @@ llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3)
 # --- State ---
 
 def merge_str(existing: str, new: str) -> str:
-    """Reducer: later value overwrites."""
     return new if new else existing
 
 class AgentState(TypedDict):
@@ -47,7 +55,7 @@ class AgentState(TypedDict):
 
 def data_agent(state: AgentState) -> dict:
     """Gathers portfolio snapshot — prices, P&L, streaks, allocation,
-    performance attribution, and threshold alerts. No LLM call."""
+    performance attribution, and threshold alerts."""
     holdings = state["holdings"]
     mode = state["mode"]
 
@@ -55,8 +63,9 @@ def data_agent(state: AgentState) -> dict:
     total_value = 0.0
     total_cost = 0.0
     total_day_pl = 0.0
-    attribution = []  # tracks each holding's contribution to daily P&L
-    alerts = []       # threshold-based warnings
+    attribution = []
+    alerts = []
+    big_move_tickers = []
 
     for h in holdings:
         quote = get_finnhub_quote(h["ticker"])
@@ -91,10 +100,10 @@ def data_agent(state: AgentState) -> dict:
             total_day_pl += day_pl
             attribution.append({"ticker": h["ticker"], "day_pl": day_pl})
 
-            # --- Threshold alerts ---
             # Big intraday move
-            if abs(quote["change_pct"]) >= 3.0:
+            if abs(quote["change_pct"]) >= BIG_MOVE_PCT:
                 alerts.append(f"BIG MOVE: {h['ticker']} is {'up' if quote['change_pct'] > 0 else 'down'} {abs(quote['change_pct']):.1f}% today")
+                big_move_tickers.append(h["ticker"])
 
             if mode == "daily":
                 store_daily_close(h["ticker"], price)
@@ -107,7 +116,7 @@ def data_agent(state: AgentState) -> dict:
         if spy_quote:
             store_daily_close("SPY", spy_quote["current"])
 
-    # Allocation + concentration check
+    # Allocation + concentration check (threshold stepping)
     alloc = []
     for h in holdings:
         q = get_finnhub_quote(h["ticker"])
@@ -115,16 +124,25 @@ def data_agent(state: AgentState) -> dict:
         if p and total_value > 0:
             weight = (p * h["shares"]) / total_value * 100
             alloc.append(f"{h['ticker']}: {weight:.1f}%")
-            if weight > 50:
-                alerts.append(f"CONCENTRATION: {h['ticker']} is {weight:.0f}% of your portfolio — that's a lot of eggs in one basket")
+
+            if weight > CONCENTRATION_BASE_PCT:
+                current_step = int(weight // CONCENTRATION_STEP_PCT) * CONCENTRATION_STEP_PCT
+                last_step = get_alert_threshold(f"concentration_{h['ticker']}")
+                if last_step is None or current_step > float(last_step):
+                    alerts.append(f"CONCENTRATION: {h['ticker']} is {weight:.0f}% of your portfolio")
+                    set_alert_threshold(f"concentration_{h['ticker']}", current_step)
+            else:
+                # Reset when below base threshold so it fires again if it crosses back
+                if get_alert_threshold(f"concentration_{h['ticker']}"):
+                    set_alert_threshold(f"concentration_{h['ticker']}", 0)
 
     lines.append(f"Allocation: {', '.join(alloc)}")
     lines.append(f"Total: ${total_value:.2f} | Cost: ${total_cost:.2f} | P&L: ${total_value - total_cost:+.2f} | Day P&L: ${total_day_pl:+.2f}")
 
-    # Drawdown from peak (total portfolio)
+    # Drawdown from peak
     if total_cost > 0:
         portfolio_return = (total_value - total_cost) / total_cost * 100
-        if portfolio_return < -5:
+        if portfolio_return < -DRAWDOWN_ALERT_PCT:
             alerts.append(f"DRAWDOWN: portfolio is down {portfolio_return:.1f}% from your total cost basis")
 
     # Performance attribution
@@ -134,22 +152,83 @@ def data_agent(state: AgentState) -> dict:
         lines.append(f"\nDay's P&L breakdown (who moved your money):")
         lines.extend(attr_lines)
 
+    # Flag which tickers had big moves (for synthesis to decide on beta explanation)
+    if big_move_tickers:
+        lines.append(f"\nBIG_MOVE_TICKERS: {', '.join(big_move_tickers)}")
+    else:
+        lines.append(f"\nBIG_MOVE_TICKERS: NONE")
+
+    # Fear & Greed Index
+    fg = get_fear_greed()
+    lines.append(f"\n{format_fear_greed(fg)}")
+
+    # Store F&G daily
+    if fg:
+        store_fear_greed(fg["score"], fg["rating"])
+
+    # Check sustained fear
+    fear_alert = check_sustained_fear()
+    if fear_alert:
+        alerts.append(fear_alert)
+
     # Threshold alerts
     if alerts:
         lines.append(f"\n=== ALERTS ===")
         for a in alerts:
             lines.append(f"  ! {a}")
 
-    # Fear & Greed Index
-    fg = get_fear_greed()
-    lines.append(f"\n{format_fear_greed(fg)}")
+    # --- Mode-specific sections ---
+
+    # Morning: yesterday's close
+    if mode == "morning":
+        yesterday = get_yesterday_closes([h["ticker"] for h in holdings])
+        if yesterday:
+            lines.append("\n=== YESTERDAY'S CLOSE ===")
+            for ticker, data in yesterday.items():
+                lines.append(f"  {ticker}: ${data['price']:.2f} ({data['date']})")
+
+        # Monday: last week's P&L
+        if datetime.now(ET).weekday() == 0:
+            last_week = get_last_week_snapshots()
+            if last_week:
+                week_pl = sum(s["day_pl"] for s in last_week)
+                lines.append(f"\n=== LAST WEEK P&L ===")
+                lines.append(f"  Total: ${week_pl:+.2f} over {len(last_week)} trading days")
+
+    # Daily: store snapshot
+    if mode == "daily":
+        fg_score = fg["score"] if fg else None
+        store_daily_snapshot(total_value, total_cost, total_day_pl, fg_score)
+
+    # Weekly: aggregate stats from daily snapshots + contributions
+    if mode == "weekly":
+        snapshots = get_weekly_snapshots()
+        if snapshots:
+            week_pl = sum(s["day_pl"] for s in snapshots)
+            best_day = max(snapshots, key=lambda s: s["day_pl"])
+            worst_day = min(snapshots, key=lambda s: s["day_pl"])
+            fg_scores = [s["fg_score"] for s in snapshots if s["fg_score"] is not None]
+            avg_fg = round(sum(fg_scores) / len(fg_scores), 1) if fg_scores else None
+
+            lines.append(f"\n=== WEEKLY STATS ===")
+            lines.append(f"  Week P&L: ${week_pl:+.2f}")
+            lines.append(f"  Best day: {best_day['date']} (${best_day['day_pl']:+.2f})")
+            lines.append(f"  Worst day: {worst_day['date']} (${worst_day['day_pl']:+.2f})")
+            if avg_fg:
+                lines.append(f"  Average Fear & Greed: {avg_fg}/100")
+
+        contributions = get_total_contributions()
+        if contributions > 0:
+            gains = total_value - contributions
+            lines.append(f"\n=== YOUR MONEY vs MARKET GAINS ===")
+            lines.append(f"  Your money (total deposited): ${contributions:.2f}")
+            lines.append(f"  Market gains: ${gains:+.2f}")
 
     return {"data_report": "\n".join(lines)}
 
 
 def news_agent(state: AgentState) -> dict:
-    """Fetches full market intelligence — news, insider activity, fundamentals,
-    earnings, analyst recommendations — then uses LLM to synthesize."""
+    """Fetches full market intelligence then uses LLM to synthesize."""
     holdings = state["holdings"]
     intel_text = get_full_intel(holdings)
 
@@ -169,6 +248,10 @@ Analyze this data and produce a concise intelligence report covering:
 When you mention a concept (52-week high, relative performance, etc.), briefly
 explain what it means in plain English. Be concise but educational.
 
+End your report with this exact line format:
+OVERNIGHT_SENTIMENT: X/10
+(1 = very bearish, 5 = neutral, 10 = very bullish, based on overall news tone)
+
 {intel_text}"""
 
     response = llm.invoke([
@@ -179,8 +262,7 @@ explain what it means in plain English. Be concise but educational.
 
 
 def quant_agent(state: AgentState) -> dict:
-    """Runs quant analysis, then uses LLM to interpret the numbers in
-    a beginner-friendly way."""
+    """Runs quant analysis, then uses LLM to interpret the numbers."""
     holdings = state["holdings"]
     summary = get_quant_summary(holdings)
     quant_text = format_quant_for_prompt(summary)
@@ -188,19 +270,15 @@ def quant_agent(state: AgentState) -> dict:
     prompt = f"""You are a quantitative analyst explaining portfolio metrics to someone
 who is 19 and learning to invest. They're smart but new to finance.
 
-Interpret these metrics and explain what each one means in plain English:
+Provide the key metrics and their interpretation:
+1. Beta values for each holding
+2. Correlation data and what it means for diversification
+3. Sharpe/Sortino ratios and whether they're good
+4. Drawdown — worst drop and recovery time
+5. Backtest — portfolio vs VTI-only approach
 
-1. Beta — what does it mean that SOXX has a beta of ~2.3? Use a simple analogy.
-2. Correlation — VTI and SCHG are 0.94 correlated. Explain why this matters
-   for diversification in a way that clicks.
-3. Sharpe/Sortino — are these good? What do they actually measure?
-4. Drawdown — what was the worst drop, and how long did recovery take?
-   Why should a beginner care about this?
-5. Backtest — is the portfolio beating a simple VTI-only approach?
-   Is the extra complexity worth it?
-
-State the numbers, then explain what they mean in real terms.
-Keep it conversational, not textbook. Do NOT give investment advice.
+State the numbers, then give a brief plain-English interpretation of each.
+Keep it factual and concise. Do NOT give investment advice.
 
 {quant_text}"""
 
@@ -216,46 +294,59 @@ IMPORTANT: The user is 19 and learning to invest. When you mention any financial
 concept, briefly explain it in plain English. For example:
 - "Sharpe ratio of 2.05 (this measures return per unit of risk — above 1 is good,
   above 2 is excellent)"
-- "VTI/SCHG correlation is 0.94 (they move almost identically, so owning both
-  doesn't add much diversification)"
 Don't be condescending — be the smart friend who explains things clearly.
 """
 
 MODE_INSTRUCTIONS = {
-    "morning": f"""It's morning, before market open. Synthesize a concise morning briefing:
-- Start with the Fear & Greed reading and what it means for today's market mood
-- What happened yesterday — who moved, by how much, and why (connect to news)
-- Surface the most important quant insight and explain what it means practically
-- Note any alerts or threshold warnings
-- What to pay attention to today
-- Keep it to 8-10 sentences. Be direct but educational.
+    "morning": f"""It's morning, before market open. Synthesize a concise morning briefing.
+
+Structure:
+1. Start with yesterday's close for each holding (use the YESTERDAY'S CLOSE data)
+2. State the Fear & Greed reading and the overnight news sentiment score
+3. One sentence outlook for the day based on beta exposure, Fear & Greed, and news
+4. Surface any alerts
+5. If LAST WEEK P&L data is present (Monday), include it as a single line
+
+HARD LIMIT: {MORNING_WORD_LIMIT} words maximum. Be direct.
 {EDUCATOR_RULE}""",
 
-    "intraday": f"""It's during market hours. Synthesize an intraday alert:
-- Only flag things that genuinely matter: 3%+ moves, alerts, news-driven moves
-- If there are threshold alerts, always include them
-- If the news explains a move, connect them explicitly
-- If nothing notable is happening AND there are no alerts, respond with exactly: SILENT
-- Keep it to 3-5 sentences if not SILENT.
+    "intraday": f"""It's during market hours. Synthesize an intraday update.
+
+Rules:
+- Put any ALERTS at the very top, clearly labeled
+- If there are no alerts AND nothing notable is happening, respond with exactly: SILENT
+- Do NOT explain what beta means UNLESS the BIG_MOVE_TICKERS field lists a ticker
+  (only then, briefly note its beta to explain why the move is amplified)
+- Do NOT mention 52-week high/low unless a holding actually broke to a new 52-week
+  high TODAY (current price >= 52-week high in the data)
+- Do NOT repeat Sharpe ratio, Sortino, drawdown, backtest, or correlation data
+- Do NOT include a disclaimer
+- Focus on: what moved, by how much, why (connect to news if clear)
+
+HARD LIMIT: {INTRADAY_WORD_LIMIT} words maximum. Shorter is better.
 {EDUCATOR_RULE}""",
 
     "daily": f"""It's end of day. Synthesize a daily summary:
 - Start with how much the portfolio made or lost today (total and per-holding attribution)
 - Who was the biggest mover and why (connect to news)
 - Include the Fear & Greed reading
-- Highlight one quant concept and explain what it means for the portfolio
 - Note any alerts
-- Keep it to 7-9 sentences.
+- Keep it to 6-8 sentences.
 {EDUCATOR_RULE}""",
 
-    "weekly": f"""It's the weekend. Synthesize a weekly digest:
-- Best and worst performer this week and why
-- Portfolio-level return for the week
-- How the portfolio stacks up against just owning VTI (use the backtest data)
-- Key quant lesson of the week — pick one concept and explain it well
-- One thing to watch next week based on news trends
-- Note any ongoing alerts (concentration, drawdown)
-- Keep it to 10-12 sentences.
+    "weekly": f"""It's the weekend. Synthesize a weekly digest.
+
+Required sections:
+1. Total week P&L (from WEEKLY STATS)
+2. Best day and worst day (from WEEKLY STATS)
+3. Average Fear & Greed for the week
+4. YOUR MONEY vs MARKET GAINS — show how much was deposited vs how much the market added
+5. How the portfolio stacks up against just owning VTI (use backtest data)
+6. One paragraph narrative: what drove this week's performance (connect news to moves)
+7. One thing to watch next week based on news trends
+
+Note any ongoing alerts (concentration, sustained fear).
+Keep it to 12-15 sentences.
 {EDUCATOR_RULE}""",
 
     "interactive": f"""The user asked a question about their portfolio. They are 19 and
@@ -294,8 +385,6 @@ def synthesis_agent(state: AgentState) -> dict:
 Rules:
 - Use specific numbers from the reports. Never fabricate.
 - Connect news to price moves when the link is clear.
-- Use quant data to add depth, not just repeat it.
-- Include the P&L attribution (who moved your money today) when relevant.
 - If there are alerts, always mention them — they're important.
 - Never recommend buying, selling, or holding."""
 

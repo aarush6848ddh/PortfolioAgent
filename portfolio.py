@@ -1,6 +1,7 @@
 """Shared utilities: database, market data, compliance, logging."""
 import os
 import re
+import logging
 import psycopg2
 import requests
 from datetime import datetime, date, time, timedelta
@@ -8,6 +9,8 @@ from dotenv import load_dotenv
 import pytz
 
 load_dotenv()
+
+log = logging.getLogger("portfolio")
 
 ET = pytz.timezone("America/New_York")
 
@@ -29,7 +32,6 @@ BANNED_PHRASES = [
 ]
 
 def sanitize_response(text):
-    """Scan for banned advisory phrases and flag them."""
     lower = text.lower()
     found = [p for p in BANNED_PHRASES if p in lower]
     if found:
@@ -50,44 +52,188 @@ def get_holdings():
     return [{"ticker": row[0], "shares": float(row[1]), "cost_basis": float(row[2])} for row in rows]
 
 def log_run(run_type, prompt, response, sent, reason):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO agent_logs (run_type, prompt, response, sent, reason) VALUES (%s, %s, %s, %s, %s)",
-        (run_type, prompt, response, sent, reason)
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO agent_logs (run_type, prompt, response, sent, reason) VALUES (%s, %s, %s, %s, %s)",
+            (run_type, prompt, response, sent, reason)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        log.error(f"Failed to log run: {e}")
 
 def store_daily_close(ticker, close_price):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """INSERT INTO daily_closes (ticker, date, close_price)
-           VALUES (%s, %s, %s) ON CONFLICT (ticker, date) DO UPDATE SET close_price = %s""",
-        (ticker, date.today(), close_price, close_price)
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO daily_closes (ticker, date, close_price)
+               VALUES (%s, %s, %s) ON CONFLICT (ticker, date) DO UPDATE SET close_price = %s""",
+            (ticker, date.today(), close_price, close_price)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        log.error(f"Failed to store daily close for {ticker}: {e}")
+
+# --- Alert State ---
+
+def get_alert_threshold(alert_type):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT last_threshold FROM alert_state WHERE alert_type = %s", (alert_type,))
+        row = cur.fetchone()
+        conn.close()
+        return float(row[0]) if row else None
+    except Exception as e:
+        log.error(f"Failed to get alert threshold: {e}")
+        return None
+
+def set_alert_threshold(alert_type, threshold):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO alert_state (alert_type, last_threshold, last_alerted_at)
+               VALUES (%s, %s, NOW())
+               ON CONFLICT (alert_type) DO UPDATE SET last_threshold = %s, last_alerted_at = NOW()""",
+            (alert_type, threshold, threshold)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        log.error(f"Failed to set alert threshold: {e}")
+
+# --- Daily Snapshots ---
+
+def store_daily_snapshot(total_value, total_cost, day_pl, fg_score=None):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO daily_snapshots (date, total_value, total_cost, day_pl, fear_greed_score)
+               VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT (date) DO UPDATE SET total_value = %s, total_cost = %s, day_pl = %s, fear_greed_score = %s""",
+            (date.today(), total_value, total_cost, day_pl, fg_score,
+             total_value, total_cost, day_pl, fg_score)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        log.error(f"Failed to store daily snapshot: {e}")
+
+def get_weekly_snapshots():
+    """Get this week's daily snapshots (Monday through today)."""
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        today = date.today()
+        monday = today - timedelta(days=today.weekday())
+        cur.execute(
+            "SELECT date, total_value, total_cost, day_pl, fear_greed_score FROM daily_snapshots WHERE date >= %s ORDER BY date",
+            (monday,)
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [{"date": r[0], "total_value": float(r[1]), "total_cost": float(r[2]),
+                 "day_pl": float(r[3]) if r[3] else 0, "fg_score": float(r[4]) if r[4] else None} for r in rows]
+    except Exception as e:
+        log.error(f"Failed to get weekly snapshots: {e}")
+        return []
+
+def get_last_week_snapshots():
+    """Get daily snapshots from last week (Mon-Fri before current week)."""
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        today = date.today()
+        this_monday = today - timedelta(days=today.weekday())
+        last_monday = this_monday - timedelta(days=7)
+        cur.execute(
+            "SELECT date, total_value, total_cost, day_pl, fear_greed_score FROM daily_snapshots WHERE date >= %s AND date < %s ORDER BY date",
+            (last_monday, this_monday)
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [{"date": r[0], "total_value": float(r[1]), "total_cost": float(r[2]),
+                 "day_pl": float(r[3]) if r[3] else 0, "fg_score": float(r[4]) if r[4] else None} for r in rows]
+    except Exception as e:
+        log.error(f"Failed to get last week snapshots: {e}")
+        return []
+
+# --- Contributions ---
+
+def store_contribution(amount, note=""):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO contributions (amount, note) VALUES (%s, %s)", (amount, note))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        log.error(f"Failed to store contribution: {e}")
+
+def get_total_contributions():
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(SUM(amount), 0) FROM contributions")
+        total = float(cur.fetchone()[0])
+        conn.close()
+        return total
+    except Exception as e:
+        log.error(f"Failed to get contributions: {e}")
+        return 0.0
+
+# --- Yesterday's Closes ---
+
+def get_yesterday_closes(tickers):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        results = {}
+        for t in tickers:
+            cur.execute(
+                "SELECT close_price, date FROM daily_closes WHERE ticker = %s AND date < %s ORDER BY date DESC LIMIT 1",
+                (t, date.today())
+            )
+            row = cur.fetchone()
+            if row:
+                results[t] = {"price": float(row[0]), "date": row[1]}
+        conn.close()
+        return results
+    except Exception as e:
+        log.error(f"Failed to get yesterday closes: {e}")
+        return {}
 
 # --- Market Data ---
 
 def get_finnhub_quote(ticker):
-    api_key = os.environ["FINNHUB_API_KEY"]
-    resp = requests.get("https://finnhub.io/api/v1/quote", params={"symbol": ticker, "token": api_key})
-    data = resp.json()
-    if not data.get("c"):
+    try:
+        api_key = os.environ["FINNHUB_API_KEY"]
+        resp = requests.get("https://finnhub.io/api/v1/quote", params={"symbol": ticker, "token": api_key}, timeout=10)
+        data = resp.json()
+        if not data.get("c"):
+            return None
+        return {
+            "current": float(data["c"]),
+            "open": float(data["o"]),
+            "high": float(data["h"]),
+            "low": float(data["l"]),
+            "prev_close": float(data["pc"]),
+            "change_pct": float(data["dp"]) if data.get("dp") else 0.0,
+        }
+    except Exception as e:
+        log.error(f"Failed to get quote for {ticker}: {e}")
         return None
-    return {
-        "current": float(data["c"]),
-        "open": float(data["o"]),
-        "high": float(data["h"]),
-        "low": float(data["l"]),
-        "prev_close": float(data["pc"]),
-        "change_pct": float(data["dp"]) if data.get("dp") else 0.0,
-    }
 
 def get_prev_close(ticker):
     conn = get_conn()

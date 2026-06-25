@@ -16,8 +16,9 @@ DISCLAIMER = "\n\n---\nData analysis only — not financial advice."
 MAX_MSG_LEN = 4096
 
 
-def send_message(text, disclaimer=True):
-    """Sync send — used by agent.py cron jobs (not the bot)."""
+def send_message(text, disclaimer=False):
+    """Sync send — used by agent.py cron jobs (not the bot).
+    Disclaimer only appended when explicitly requested (morning briefing only)."""
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     url = f"https://api.telegram.org/bot{token}/sendMessage"

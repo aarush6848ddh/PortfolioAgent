@@ -17,6 +17,20 @@ def buy(ticker, shares, cost_basis):
     conn.close()
     print(f"Bought {shares} shares of {ticker}, at ${cost_basis}")
 
+    # Track contribution (money deposited)
+    try:
+        amount = float(shares) * float(cost_basis)
+        cur2 = get_conn().cursor()
+        conn2 = get_conn()
+        cur2 = conn2.cursor()
+        cur2.execute("INSERT INTO contributions (amount, note) VALUES (%s, %s)",
+                     (amount, f"Buy {shares} {ticker} @ ${cost_basis}"))
+        conn2.commit()
+        cur2.close()
+        conn2.close()
+    except Exception as e:
+        print(f"Warning: failed to log contribution: {e}")
+
 def sell(ticker, shares, sale_price=None):
     shares = float(shares)
     conn = get_conn()
