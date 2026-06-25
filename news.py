@@ -1,18 +1,26 @@
-"""Market intelligence module — news, insider data, earnings, fundamentals from Finnhub."""
+"""Market intelligence module — news, insider data, earnings, fundamentals,
+ETF holdings, technicals, sentiment, congressional trading from Finnhub."""
 import os
+import logging
 import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
 
+log = logging.getLogger("news")
+
 API_KEY = os.environ["FINNHUB_API_KEY"]
 BASE = "https://finnhub.io/api/v1"
 
 def _get(endpoint, params):
     params["token"] = API_KEY
-    resp = requests.get(f"{BASE}/{endpoint}", params=params)
-    return resp.json() if resp.ok else {}
+    try:
+        resp = requests.get(f"{BASE}/{endpoint}", params=params, timeout=10)
+        return resp.json() if resp.ok else {}
+    except Exception as e:
+        log.error(f"Finnhub {endpoint} failed: {e}")
+        return {}
 
 # --- Company News ---
 
@@ -35,21 +43,19 @@ def get_company_news(ticker, days=2):
 # --- Insider Sentiment (MSPR) ---
 
 def get_insider_sentiment(ticker):
-    """Get monthly insider sentiment. MSPR ranges -100 (bearish) to +100 (bullish)."""
     today = datetime.now().strftime("%Y-%m-%d")
     six_months_ago = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
     data = _get("stock/insider-sentiment", {"symbol": ticker, "from": six_months_ago, "to": today})
     months = data.get("data", [])
     if not months:
         return None
-    # Return most recent months
     recent = months[-3:] if len(months) >= 3 else months
     return [
         {
             "year": m.get("year"),
             "month": m.get("month"),
             "mspr": round(m.get("mspr", 0), 2),
-            "change": m.get("change", 0),  # net shares bought/sold
+            "change": m.get("change", 0),
         }
         for m in recent
     ]
@@ -57,7 +63,6 @@ def get_insider_sentiment(ticker):
 # --- Insider Transactions ---
 
 def get_insider_transactions(ticker, limit=5):
-    """Get recent insider buy/sell transactions."""
     data = _get("stock/insider-transactions", {"symbol": ticker})
     txns = data.get("data", [])
     if not txns:
@@ -66,7 +71,7 @@ def get_insider_transactions(ticker, limit=5):
         {
             "name": t.get("name", ""),
             "share": t.get("share", 0),
-            "change": t.get("change", 0),  # positive = buy, negative = sell
+            "change": t.get("change", 0),
             "transaction_type": "Buy" if t.get("change", 0) > 0 else "Sell",
             "date": t.get("transactionDate", ""),
             "price": t.get("transactionPrice"),
@@ -77,7 +82,6 @@ def get_insider_transactions(ticker, limit=5):
 # --- Recommendation Trends ---
 
 def get_recommendations(ticker):
-    """Get analyst recommendation trends (strong buy/buy/hold/sell/strong sell)."""
     data = _get("stock/recommendation", {"symbol": ticker})
     if not isinstance(data, list) or not data:
         return None
@@ -94,7 +98,6 @@ def get_recommendations(ticker):
 # --- Earnings Calendar ---
 
 def get_upcoming_earnings(days_ahead=7):
-    """Get earnings reports in the next N days."""
     today = datetime.now().strftime("%Y-%m-%d")
     future = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
     data = _get("calendar/earnings", {"from": today, "to": future})
@@ -112,7 +115,6 @@ def get_upcoming_earnings(days_ahead=7):
 # --- Earnings Surprises ---
 
 def get_earnings_surprises(ticker, limit=4):
-    """Get recent EPS actual vs estimate."""
     data = _get("stock/earnings", {"symbol": ticker, "limit": limit})
     if not isinstance(data, list) or not data:
         return None
@@ -129,26 +131,21 @@ def get_earnings_surprises(ticker, limit=4):
 # --- Basic Financials / Metrics ---
 
 def get_basic_financials(ticker):
-    """Get key financial metrics — works for both stocks and ETFs."""
     data = _get("stock/metric", {"symbol": ticker, "metric": "all"})
     m = data.get("metric", {})
     if not m:
         return None
 
     result = {}
-    # 52-week range
     if m.get("52WeekHigh"):
         result["52_week_high"] = m["52WeekHigh"]
         result["52_week_high_date"] = m.get("52WeekHighDate", "")
     if m.get("52WeekLow"):
         result["52_week_low"] = m["52WeekLow"]
         result["52_week_low_date"] = m.get("52WeekLowDate", "")
-
-    # Beta
     if m.get("beta"):
         result["finnhub_beta"] = round(m["beta"], 3)
 
-    # Price returns
     for key, label in [
         ("5DayPriceReturnDaily", "5d_return"),
         ("13WeekPriceReturnDaily", "13w_return"),
@@ -160,7 +157,6 @@ def get_basic_financials(ticker):
         if m.get(key) is not None:
             result[label] = round(m[key], 2)
 
-    # S&P 500 relative performance
     for key, label in [
         ("priceRelativeToS&P5004Week", "vs_sp500_4w"),
         ("priceRelativeToS&P50013Week", "vs_sp500_13w"),
@@ -169,7 +165,6 @@ def get_basic_financials(ticker):
         if m.get(key) is not None:
             result[label] = round(m[key], 2)
 
-    # Stock-specific metrics (won't exist for ETFs)
     for key, label in [
         ("peNormalizedAnnual", "pe_ratio"),
         ("psTTM", "ps_ratio"),
@@ -185,13 +180,262 @@ def get_basic_financials(ticker):
 
     return result
 
+# --- ETF Holdings ---
+
+def get_etf_holdings(ticker, limit=10):
+    """Get top holdings of an ETF."""
+    data = _get("etf/holdings", {"symbol": ticker})
+    holdings = data.get("holdings", [])
+    if not holdings:
+        return []
+    return [
+        {
+            "symbol": h.get("symbol", "N/A"),
+            "name": h.get("name", ""),
+            "percent": round(h.get("percent", 0) * 100, 2) if h.get("percent", 0) < 1 else round(h.get("percent", 0), 2),
+            "value": h.get("value"),
+        }
+        for h in holdings[:limit]
+    ]
+
+# --- ETF Sector Exposure ---
+
+def get_etf_sector_exposure(ticker):
+    """Get sector breakdown of an ETF."""
+    data = _get("etf/sector", {"symbol": ticker})
+    sectors = data.get("sectorExposure", [])
+    if not sectors:
+        return []
+    return [
+        {"sector": s.get("sector", ""), "percent": round(s.get("percent", 0) * 100, 2) if s.get("percent", 0) < 1 else round(s.get("percent", 0), 2)}
+        for s in sectors if s.get("percent", 0) > 0
+    ]
+
+# --- Economic Calendar ---
+
+def get_economic_calendar(days_ahead=3):
+    """Get upcoming economic events (CPI, jobs, Fed, etc.)."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    future = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+    data = _get("calendar/economic", {"from": today, "to": future})
+    events = data.get("economicCalendar", {}).get("result", [])
+    if not isinstance(events, list):
+        return []
+    # Filter to high-impact events
+    high_impact = [e for e in events if e.get("impact", "") == "high"]
+    if high_impact:
+        return [
+            {
+                "event": e.get("event", ""),
+                "country": e.get("country", ""),
+                "time": e.get("time", ""),
+                "impact": e.get("impact", ""),
+                "previous": e.get("prev"),
+                "estimate": e.get("estimate"),
+                "actual": e.get("actual"),
+            }
+            for e in high_impact[:10]
+        ]
+    # Fall back to all events if no high-impact
+    return [
+        {
+            "event": e.get("event", ""),
+            "country": e.get("country", ""),
+            "time": e.get("time", ""),
+            "impact": e.get("impact", ""),
+        }
+        for e in events[:10]
+    ]
+
+# --- Upgrade/Downgrade ---
+
+def get_upgrades_downgrades(ticker, days=14):
+    """Get recent analyst rating changes."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    data = _get("stock/upgrade-downgrade", {"symbol": ticker, "from": from_date, "to": today})
+    if not isinstance(data, list):
+        return []
+    return [
+        {
+            "company": d.get("company", ""),
+            "action": d.get("action", ""),
+            "from_grade": d.get("fromGrade", ""),
+            "to_grade": d.get("toGrade", ""),
+            "date": d.get("gradeTime", ""),
+        }
+        for d in data[:5]
+    ]
+
+# --- Price Target ---
+
+def get_price_target(ticker):
+    """Get analyst consensus price target."""
+    data = _get("stock/price-target", {"symbol": ticker})
+    if not data.get("targetHigh"):
+        return None
+    return {
+        "high": data.get("targetHigh"),
+        "low": data.get("targetLow"),
+        "mean": data.get("targetMean"),
+        "median": data.get("targetMedian"),
+        "last_updated": data.get("lastUpdated", ""),
+    }
+
+# --- Congressional Trading ---
+
+def get_congressional_trading(ticker, limit=5):
+    """Get recent congressional stock trading activity."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    from_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+    data = _get("stock/congressional-trading", {"symbol": ticker, "from": from_date, "to": today})
+    trades = data.get("data", [])
+    if not isinstance(trades, list) or not trades:
+        return []
+    return [
+        {
+            "name": t.get("name", ""),
+            "amount": t.get("amount", ""),
+            "transaction_type": t.get("transactionType", ""),
+            "date": t.get("transactionDate", ""),
+        }
+        for t in trades[:limit]
+    ]
+
+# --- Social Sentiment ---
+
+def get_social_sentiment(ticker):
+    """Get Reddit/Twitter social sentiment data."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    from_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+    data = _get("stock/social-sentiment", {"symbol": ticker, "from": from_date, "to": today})
+    reddit = data.get("reddit", [])
+    twitter = data.get("twitter", [])
+
+    result = {}
+    if reddit:
+        total_mentions = sum(r.get("mention", 0) for r in reddit)
+        avg_score = sum(r.get("score", 0) for r in reddit) / len(reddit) if reddit else 0
+        result["reddit_mentions"] = total_mentions
+        result["reddit_sentiment"] = round(avg_score, 3)
+    if twitter:
+        total_mentions = sum(t.get("mention", 0) for t in twitter)
+        avg_score = sum(t.get("score", 0) for t in twitter) / len(twitter) if twitter else 0
+        result["twitter_mentions"] = total_mentions
+        result["twitter_sentiment"] = round(avg_score, 3)
+    return result if result else None
+
+# --- Technical Indicators ---
+
+def get_aggregate_indicators(ticker, resolution="D"):
+    """Get aggregate technical indicator signals (buy/sell/neutral counts)."""
+    data = _get("scan/technical-indicator", {"symbol": ticker, "resolution": resolution})
+    tech = data.get("technicalAnalysis", {})
+    trend = data.get("trend", {})
+    if not tech:
+        return None
+    return {
+        "buy": tech.get("count", {}).get("buy", 0),
+        "sell": tech.get("count", {}).get("sell", 0),
+        "neutral": tech.get("count", {}).get("neutral", 0),
+        "signal": tech.get("signal", ""),
+        "adx": trend.get("adx", None),
+        "trending": trend.get("trending", None),
+    }
+
+# --- Support/Resistance ---
+
+def get_support_resistance(ticker, resolution="D"):
+    """Get key support and resistance price levels."""
+    data = _get("scan/support-resistance", {"symbol": ticker, "resolution": resolution})
+    levels = data.get("levels", [])
+    if not levels:
+        return None
+    return [round(l, 2) for l in levels[:6]]
+
+# --- Pattern Recognition ---
+
+def get_pattern_recognition(ticker, resolution="D"):
+    """Get detected chart patterns."""
+    data = _get("scan/pattern", {"symbol": ticker, "resolution": resolution})
+    points = data.get("points", [])
+    if not isinstance(points, list) or not points:
+        return []
+    return [
+        {
+            "pattern": p.get("patternname", ""),
+            "type": p.get("patterntype", ""),
+            "status": p.get("status", ""),
+        }
+        for p in points[:5]
+    ]
+
+# --- ESG Scores ---
+
+def get_esg_score(ticker):
+    """Get ESG (Environmental, Social, Governance) scores."""
+    data = _get("stock/esg", {"symbol": ticker})
+    if not data.get("totalESGScore"):
+        return None
+    return {
+        "total": data.get("totalESGScore"),
+        "environment": data.get("environmentScore"),
+        "social": data.get("socialScore"),
+        "governance": data.get("governanceScore"),
+    }
+
+# --- Dividends ---
+
+def get_dividends(ticker, days=365):
+    """Get dividend history."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    data = _get("stock/dividend", {"symbol": ticker, "from": from_date, "to": today})
+    if not isinstance(data, list):
+        return []
+    return [
+        {
+            "ex_date": d.get("date", ""),
+            "pay_date": d.get("payDate", ""),
+            "amount": d.get("amount", 0),
+            "currency": d.get("currency", "USD"),
+        }
+        for d in data[:10]
+    ]
+
+# --- Market Status ---
+
+def get_market_status():
+    """Get real-time market open/closed status for US exchanges."""
+    data = _get("stock/market-status", {"exchange": "US"})
+    if not data:
+        return None
+    return {
+        "exchange": data.get("exchange", "US"),
+        "is_open": data.get("isOpen", False),
+        "session": data.get("session", ""),
+        "holiday": data.get("holiday", ""),
+        "timezone": data.get("t", ""),
+    }
+
+# --- Bond Yield Curve ---
+
+def get_bond_yield_curve():
+    """Get US Treasury yield curve."""
+    data = _get("bond/yield-curve", {"code": "10y"})
+    if not data.get("data"):
+        return None
+    points = data["data"]
+    if not isinstance(points, list):
+        return None
+    return [{"maturity": p.get("d", ""), "yield": p.get("v")} for p in points[:10] if p.get("v")]
+
+
 # --- Full Intelligence Report ---
 
 def get_full_intel(holdings):
-    """Gather all available Finnhub intelligence for the portfolio.
-    Returns a dict with all data, formatted as text for LLM consumption."""
+    """Gather all available Finnhub intelligence for the portfolio."""
     tickers = [h["ticker"] for h in holdings]
-
     sections = []
 
     # 1. News
@@ -205,7 +449,7 @@ def get_full_intel(holdings):
         else:
             sections.append(f"{t}: No recent news")
 
-    # 2. Basic Financials (works for ETFs)
+    # 2. Basic Financials
     sections.append("\n=== KEY METRICS ===")
     for t in tickers:
         metrics = get_basic_financials(t)
@@ -229,24 +473,45 @@ def get_full_intel(holdings):
                 parts.append(f"Div: {metrics['dividend_yield']:.2f}%")
             sections.append(f"{t}: {' | '.join(parts)}")
 
-    # 3. Insider Sentiment (stocks only, skip for ETFs silently)
+    # 3. ETF Holdings
+    etf_data = []
+    for t in tickers:
+        holdings_data = get_etf_holdings(t)
+        if holdings_data:
+            etf_data.append(f"{t} top holdings:")
+            for h in holdings_data[:5]:
+                etf_data.append(f"  {h['symbol']}: {h['percent']}% — {h['name']}")
+    if etf_data:
+        sections.append("\n=== ETF HOLDINGS (what you actually own) ===")
+        sections.extend(etf_data)
+
+    # 4. ETF Sector Exposure
+    sector_data = []
+    for t in tickers:
+        sectors = get_etf_sector_exposure(t)
+        if sectors:
+            sector_parts = [f"{s['sector']}: {s['percent']}%" for s in sectors[:5]]
+            sector_data.append(f"{t}: {', '.join(sector_parts)}")
+    if sector_data:
+        sections.append("\n=== ETF SECTOR EXPOSURE ===")
+        sections.extend(sector_data)
+
+    # 5. Insider Activity
     insider_data = []
     for t in tickers:
         sentiment = get_insider_sentiment(t)
         if sentiment:
             latest = sentiment[-1]
             insider_data.append(f"{t}: MSPR {latest['mspr']:+.2f} (net shares: {latest['change']:+,})")
-
         txns = get_insider_transactions(t)
         if txns:
             for tx in txns[:3]:
                 insider_data.append(f"  {tx['name']}: {tx['transaction_type']} {abs(tx['change']):,} shares @ ${tx['price'] or 'N/A'} ({tx['date']})")
-
     if insider_data:
         sections.append("\n=== INSIDER ACTIVITY ===")
         sections.extend(insider_data)
 
-    # 4. Analyst Recommendations (stocks only)
+    # 6. Analyst Recommendations
     rec_data = []
     for t in tickers:
         rec = get_recommendations(t)
@@ -261,18 +526,38 @@ def get_full_intel(holdings):
         sections.append("\n=== ANALYST RECOMMENDATIONS ===")
         sections.extend(rec_data)
 
-    # 5. Earnings Calendar (upcoming for any stock)
+    # 7. Upgrade/Downgrade
+    upgrade_data = []
+    for t in tickers:
+        changes = get_upgrades_downgrades(t)
+        if changes:
+            for c in changes:
+                upgrade_data.append(f"{t}: {c['company']} — {c['action']} ({c['from_grade']} -> {c['to_grade']}) {c['date']}")
+    if upgrade_data:
+        sections.append("\n=== RECENT UPGRADES/DOWNGRADES ===")
+        sections.extend(upgrade_data)
+
+    # 8. Price Targets
+    target_data = []
+    for t in tickers:
+        pt = get_price_target(t)
+        if pt:
+            target_data.append(f"{t}: median ${pt['median']}, mean ${pt['mean']}, range ${pt['low']}-${pt['high']}")
+    if target_data:
+        sections.append("\n=== ANALYST PRICE TARGETS ===")
+        sections.extend(target_data)
+
+    # 9. Earnings Calendar
     upcoming = get_upcoming_earnings(days_ahead=7)
     if upcoming:
         sections.append(f"\n=== EARNINGS THIS WEEK ({len(upcoming)} companies reporting) ===")
-        # Show first 15
         for e in upcoming[:15]:
             eps = f"est EPS: {e['eps_estimate']}" if e["eps_estimate"] else "no estimate"
             sections.append(f"  {e['symbol']}: {e['date']} ({eps})")
         if len(upcoming) > 15:
             sections.append(f"  ... and {len(upcoming) - 15} more")
 
-    # 6. Earnings Surprises (stocks only)
+    # 10. Earnings Surprises
     surprise_data = []
     for t in tickers:
         surprises = get_earnings_surprises(t)
@@ -282,5 +567,91 @@ def get_full_intel(holdings):
     if surprise_data:
         sections.append("\n=== EARNINGS TRACK RECORD ===")
         sections.extend(surprise_data)
+
+    # 11. Economic Calendar
+    econ_events = get_economic_calendar(days_ahead=3)
+    if econ_events:
+        sections.append(f"\n=== ECONOMIC CALENDAR (next 3 days) ===")
+        for e in econ_events:
+            impact_tag = f"[{e.get('impact', '').upper()}]" if e.get("impact") else ""
+            prev_str = f" (prev: {e['previous']})" if e.get("previous") else ""
+            est_str = f" (est: {e['estimate']})" if e.get("estimate") else ""
+            sections.append(f"  {impact_tag} {e['event']} ({e.get('country', '')}) {e.get('time', '')}{prev_str}{est_str}")
+
+    # 12. Congressional Trading
+    congress_data = []
+    for t in tickers:
+        trades = get_congressional_trading(t)
+        if trades:
+            for ct in trades:
+                congress_data.append(f"{t}: {ct['name']} — {ct['transaction_type']} {ct['amount']} ({ct['date']})")
+    if congress_data:
+        sections.append("\n=== CONGRESSIONAL TRADING ===")
+        sections.extend(congress_data)
+
+    # 13. Social Sentiment
+    social_data = []
+    for t in tickers:
+        sentiment = get_social_sentiment(t)
+        if sentiment:
+            parts = []
+            if "reddit_mentions" in sentiment:
+                parts.append(f"Reddit: {sentiment['reddit_mentions']} mentions (score: {sentiment['reddit_sentiment']})")
+            if "twitter_mentions" in sentiment:
+                parts.append(f"Twitter: {sentiment['twitter_mentions']} mentions (score: {sentiment['twitter_sentiment']})")
+            if parts:
+                social_data.append(f"{t}: {' | '.join(parts)}")
+    if social_data:
+        sections.append("\n=== SOCIAL SENTIMENT ===")
+        sections.extend(social_data)
+
+    # 14. Technical Indicators
+    tech_data = []
+    for t in tickers:
+        indicators = get_aggregate_indicators(t)
+        if indicators:
+            tech_data.append(
+                f"{t}: Signal={indicators['signal']} "
+                f"(Buy: {indicators['buy']}, Sell: {indicators['sell']}, Neutral: {indicators['neutral']})"
+                + (f" ADX: {indicators['adx']:.1f} (trending: {indicators['trending']})" if indicators.get("adx") else "")
+            )
+        levels = get_support_resistance(t)
+        if levels:
+            tech_data.append(f"  Support/Resistance levels: {', '.join(f'${l}' for l in levels)}")
+    if tech_data:
+        sections.append("\n=== TECHNICAL INDICATORS ===")
+        sections.extend(tech_data)
+
+    # 15. Chart Patterns
+    pattern_data = []
+    for t in tickers:
+        patterns = get_pattern_recognition(t)
+        if patterns:
+            for p in patterns:
+                pattern_data.append(f"{t}: {p['pattern']} ({p['type']}) — {p['status']}")
+    if pattern_data:
+        sections.append("\n=== CHART PATTERNS ===")
+        sections.extend(pattern_data)
+
+    # 16. ESG Scores
+    esg_data = []
+    for t in tickers:
+        esg = get_esg_score(t)
+        if esg:
+            esg_data.append(f"{t}: Total ESG={esg['total']}, Env={esg['environment']}, Social={esg['social']}, Gov={esg['governance']}")
+    if esg_data:
+        sections.append("\n=== ESG SCORES ===")
+        sections.extend(esg_data)
+
+    # 17. Dividends
+    div_data = []
+    for t in tickers:
+        divs = get_dividends(t, days=180)
+        if divs:
+            recent = divs[0]
+            div_data.append(f"{t}: last dividend ${recent['amount']} (ex-date: {recent['ex_date']}, pay: {recent['pay_date']})")
+    if div_data:
+        sections.append("\n=== RECENT DIVIDENDS ===")
+        sections.extend(div_data)
 
     return "\n".join(sections)

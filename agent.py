@@ -4,15 +4,20 @@ Modes:
   --morning   Pre-market briefing (8:55 AM ET) — includes disclaimer
   (default)   Intraday check (every 30 min during market hours)
   --summary   End-of-day summary (4:05 PM ET)
-  --weekly    Weekend digest (Saturday 9 AM ET / Friday after close)
-
-All reasoning flows through the multi-agent orchestrator:
-  data_agent + news_agent + quant_agent -> synthesis_agent
+  --weekly    Weekend digest (Friday after close / Saturday 9 AM ET)
 """
 import sys
+import logging
 from portfolio import is_market_open, log_run
 from orchestrator import run_agents
-from tg_helpers import send_message
+from tg_helpers import send_message, send_photo
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("agent")
 
 
 def morning_briefing():
@@ -46,6 +51,16 @@ def weekly_digest():
     response = run_agents("weekly")
     log_run("weekly", "multi-agent pipeline", response, True, "weekly digest always sent")
     send_message(f"Weekly Digest\n\n{response}", disclaimer=False)
+
+    # Generate and send charts
+    try:
+        from reports import generate_weekly_report
+        chart_paths = generate_weekly_report()
+        for path in chart_paths:
+            send_photo(path)
+            log.info(f"Sent chart: {path}")
+    except Exception as e:
+        log.error(f"Failed to generate/send charts: {e}")
 
 
 if __name__ == "__main__":

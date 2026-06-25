@@ -130,7 +130,6 @@ def store_daily_snapshot(total_value, total_cost, day_pl, fg_score=None):
         log.error(f"Failed to store daily snapshot: {e}")
 
 def get_weekly_snapshots():
-    """Get this week's daily snapshots (Monday through today)."""
     try:
         conn = get_conn()
         cur = conn.cursor()
@@ -149,7 +148,6 @@ def get_weekly_snapshots():
         return []
 
 def get_last_week_snapshots():
-    """Get daily snapshots from last week (Mon-Fri before current week)."""
     try:
         conn = get_conn()
         cur = conn.cursor()
@@ -166,6 +164,23 @@ def get_last_week_snapshots():
                  "day_pl": float(r[3]) if r[3] else 0, "fg_score": float(r[4]) if r[4] else None} for r in rows]
     except Exception as e:
         log.error(f"Failed to get last week snapshots: {e}")
+        return []
+
+def get_monthly_snapshots():
+    """Get daily snapshots for the last 30 days — for PDF report charts."""
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT date, total_value, total_cost, day_pl, fear_greed_score FROM daily_snapshots WHERE date >= %s ORDER BY date",
+            (date.today() - timedelta(days=30),)
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [{"date": r[0], "total_value": float(r[1]), "total_cost": float(r[2]),
+                 "day_pl": float(r[3]) if r[3] else 0, "fg_score": float(r[4]) if r[4] else None} for r in rows]
+    except Exception as e:
+        log.error(f"Failed to get monthly snapshots: {e}")
         return []
 
 # --- Contributions ---
@@ -191,6 +206,99 @@ def get_total_contributions():
         return total
     except Exception as e:
         log.error(f"Failed to get contributions: {e}")
+        return 0.0
+
+# --- Decision Memory ---
+
+def store_decision_memory(run_type, takeaways, portfolio_value):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO decision_memory (date, run_type, takeaways, portfolio_value) VALUES (%s, %s, %s, %s)",
+            (date.today(), run_type, takeaways, portfolio_value)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        log.error(f"Failed to store decision memory: {e}")
+
+def get_recent_decisions(limit=5):
+    """Get recent decision memories for context injection."""
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT date, run_type, takeaways, portfolio_value FROM decision_memory ORDER BY created_at DESC LIMIT %s",
+            (limit,)
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [{"date": r[0], "run_type": r[1], "takeaways": r[2],
+                 "portfolio_value": float(r[3]) if r[3] else None} for r in rows]
+    except Exception as e:
+        log.error(f"Failed to get decisions: {e}")
+        return []
+
+# --- Target Allocation + Drift ---
+
+def set_target_allocation(ticker, target_pct):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO target_allocation (ticker, target_pct)
+               VALUES (%s, %s)
+               ON CONFLICT (ticker) DO UPDATE SET target_pct = %s""",
+            (ticker, target_pct, target_pct)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        log.error(f"Failed to set target allocation: {e}")
+
+def get_target_allocations():
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT ticker, target_pct FROM target_allocation")
+        rows = cur.fetchall()
+        conn.close()
+        return {r[0]: float(r[1]) for r in rows}
+    except Exception as e:
+        log.error(f"Failed to get target allocations: {e}")
+        return {}
+
+# --- Dividends ---
+
+def store_dividend(ticker, amount, ex_date, pay_date):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO dividends (ticker, amount, ex_date, pay_date)
+               VALUES (%s, %s, %s, %s)
+               ON CONFLICT (ticker, ex_date) DO NOTHING""",
+            (ticker, amount, ex_date, pay_date)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        log.error(f"Failed to store dividend: {e}")
+
+def get_total_dividends():
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(SUM(amount), 0) FROM dividends")
+        total = float(cur.fetchone()[0])
+        conn.close()
+        return total
+    except Exception as e:
+        log.error(f"Failed to get dividends: {e}")
         return 0.0
 
 # --- Yesterday's Closes ---
@@ -280,6 +388,16 @@ def get_latest_price(ticker):
 # --- Market Hours ---
 
 def is_market_open():
+    """Check if US market is open using Finnhub API (handles half-days/holidays).
+    Falls back to hardcoded schedule if API fails."""
+    try:
+        from news import get_market_status
+        status = get_market_status()
+        if status:
+            return status["is_open"]
+    except Exception:
+        pass
+    # Fallback: hardcoded schedule
     now = datetime.now(ET)
     if now.weekday() >= 5:
         return False

@@ -1,10 +1,11 @@
 """Multi-agent orchestrator using LangGraph.
 
-Four specialist agents run in parallel, then a synthesis agent combines their reports:
+Six specialist agents — data, news, quant run in parallel, then bull/bear debate,
+then synthesis combines everything:
 
   [START] ──┬── data_agent ───┐
-             ├── news_agent ───┼── synthesis_agent ── [END]
-             └── quant_agent ──┘
+             ├── news_agent ───┼──┬── bull_agent ──┐
+             └── quant_agent ──┘  └── bear_agent ──┼── synthesis_agent ── [END]
 """
 import os
 from datetime import datetime, timedelta, date
@@ -19,7 +20,9 @@ from portfolio import (
     store_daily_close, get_conn, SYSTEM_PROMPT, sanitize_response,
     get_alert_threshold, set_alert_threshold,
     store_daily_snapshot, get_weekly_snapshots, get_last_week_snapshots,
-    get_yesterday_closes, get_total_contributions, ET,
+    get_yesterday_closes, get_total_contributions, get_total_dividends,
+    get_recent_decisions, store_decision_memory,
+    get_target_allocations, ET,
 )
 from quant import get_quant_summary, format_quant_for_prompt
 from news import get_full_intel
@@ -29,7 +32,7 @@ from sentiment import (
 )
 from config import (
     CONCENTRATION_BASE_PCT, CONCENTRATION_STEP_PCT,
-    BIG_MOVE_PCT, DRAWDOWN_ALERT_PCT,
+    BIG_MOVE_PCT, DRAWDOWN_ALERT_PCT, DRIFT_ALERT_PCT,
     INTRADAY_WORD_LIMIT, MORNING_WORD_LIMIT,
 )
 
@@ -49,13 +52,15 @@ class AgentState(TypedDict):
     data_report: Annotated[str, merge_str]
     news_report: Annotated[str, merge_str]
     quant_report: Annotated[str, merge_str]
+    bull_report: Annotated[str, merge_str]
+    bear_report: Annotated[str, merge_str]
     synthesis: Annotated[str, merge_str]
 
 # --- Agent Nodes ---
 
 def data_agent(state: AgentState) -> dict:
     """Gathers portfolio snapshot — prices, P&L, streaks, allocation,
-    performance attribution, and threshold alerts."""
+    performance attribution, threshold alerts, drift detection."""
     holdings = state["holdings"]
     mode = state["mode"]
 
@@ -100,7 +105,6 @@ def data_agent(state: AgentState) -> dict:
             total_day_pl += day_pl
             attribution.append({"ticker": h["ticker"], "day_pl": day_pl})
 
-            # Big intraday move
             if abs(quote["change_pct"]) >= BIG_MOVE_PCT:
                 alerts.append(f"BIG MOVE: {h['ticker']} is {'up' if quote['change_pct'] > 0 else 'down'} {abs(quote['change_pct']):.1f}% today")
                 big_move_tickers.append(h["ticker"])
@@ -118,12 +122,14 @@ def data_agent(state: AgentState) -> dict:
 
     # Allocation + concentration check (threshold stepping)
     alloc = []
+    current_alloc = {}
     for h in holdings:
         q = get_finnhub_quote(h["ticker"])
         p = q["current"] if q else get_prev_close(h["ticker"])
         if p and total_value > 0:
             weight = (p * h["shares"]) / total_value * 100
             alloc.append(f"{h['ticker']}: {weight:.1f}%")
+            current_alloc[h["ticker"]] = weight
 
             if weight > CONCENTRATION_BASE_PCT:
                 current_step = int(weight // CONCENTRATION_STEP_PCT) * CONCENTRATION_STEP_PCT
@@ -132,12 +138,23 @@ def data_agent(state: AgentState) -> dict:
                     alerts.append(f"CONCENTRATION: {h['ticker']} is {weight:.0f}% of your portfolio")
                     set_alert_threshold(f"concentration_{h['ticker']}", current_step)
             else:
-                # Reset when below base threshold so it fires again if it crosses back
                 if get_alert_threshold(f"concentration_{h['ticker']}"):
                     set_alert_threshold(f"concentration_{h['ticker']}", 0)
 
     lines.append(f"Allocation: {', '.join(alloc)}")
     lines.append(f"Total: ${total_value:.2f} | Cost: ${total_cost:.2f} | P&L: ${total_value - total_cost:+.2f} | Day P&L: ${total_day_pl:+.2f}")
+
+    # Drift detection (target allocation)
+    targets = get_target_allocations()
+    if targets and current_alloc:
+        drift_alerts = []
+        for ticker, target in targets.items():
+            actual = current_alloc.get(ticker, 0)
+            drift = actual - target
+            if abs(drift) >= DRIFT_ALERT_PCT:
+                direction = "overweight" if drift > 0 else "underweight"
+                drift_alerts.append(f"DRIFT: {ticker} is {direction} by {abs(drift):.1f}pp (target: {target:.0f}%, actual: {actual:.1f}%)")
+        alerts.extend(drift_alerts)
 
     # Drawdown from peak
     if total_cost > 0:
@@ -152,7 +169,7 @@ def data_agent(state: AgentState) -> dict:
         lines.append(f"\nDay's P&L breakdown (who moved your money):")
         lines.extend(attr_lines)
 
-    # Flag which tickers had big moves (for synthesis to decide on beta explanation)
+    # Big move flag for synthesis
     if big_move_tickers:
         lines.append(f"\nBIG_MOVE_TICKERS: {', '.join(big_move_tickers)}")
     else:
@@ -179,15 +196,13 @@ def data_agent(state: AgentState) -> dict:
 
     # --- Mode-specific sections ---
 
-    # Morning: yesterday's close
+    # Morning: yesterday's close + Monday last-week P&L
     if mode == "morning":
         yesterday = get_yesterday_closes([h["ticker"] for h in holdings])
         if yesterday:
             lines.append("\n=== YESTERDAY'S CLOSE ===")
             for ticker, data in yesterday.items():
                 lines.append(f"  {ticker}: ${data['price']:.2f} ({data['date']})")
-
-        # Monday: last week's P&L
         if datetime.now(ET).weekday() == 0:
             last_week = get_last_week_snapshots()
             if last_week:
@@ -200,7 +215,7 @@ def data_agent(state: AgentState) -> dict:
         fg_score = fg["score"] if fg else None
         store_daily_snapshot(total_value, total_cost, total_day_pl, fg_score)
 
-    # Weekly: aggregate stats from daily snapshots + contributions
+    # Weekly: aggregate stats + contributions + dividends
     if mode == "weekly":
         snapshots = get_weekly_snapshots()
         if snapshots:
@@ -218,11 +233,22 @@ def data_agent(state: AgentState) -> dict:
                 lines.append(f"  Average Fear & Greed: {avg_fg}/100")
 
         contributions = get_total_contributions()
+        dividends = get_total_dividends()
         if contributions > 0:
             gains = total_value - contributions
             lines.append(f"\n=== YOUR MONEY vs MARKET GAINS ===")
             lines.append(f"  Your money (total deposited): ${contributions:.2f}")
             lines.append(f"  Market gains: ${gains:+.2f}")
+            if dividends > 0:
+                lines.append(f"  Total dividends received: ${dividends:.2f}")
+
+    # Decision history context (for synthesis)
+    decisions = get_recent_decisions(limit=5)
+    if decisions:
+        lines.append(f"\n=== RECENT DECISION MEMORY ===")
+        for d in decisions:
+            val_str = f" (portfolio: ${d['portfolio_value']:.2f})" if d["portfolio_value"] else ""
+            lines.append(f"  [{d['date']}] {d['takeaways']}{val_str}")
 
     return {"data_report": "\n".join(lines)}
 
@@ -239,18 +265,18 @@ learning how markets work. The portfolio holds: {', '.join(tickers)}.
 Analyze this data and produce a concise intelligence report covering:
 1. News sentiment — what's the overall tone? Any headline that could move prices?
 2. Positioning context — where is each holding relative to its 52-week range?
-   Is anything near a high or low? Explain why this matters.
-3. Insider signals — if insider data exists, explain what MSPR means and what
-   the current reading tells us.
-4. Earnings risk — are any companies reporting soon? Explain why earnings matter.
-5. Relative performance — how are the holdings doing vs the S&P 500?
+3. ETF holdings — what are the top holdings driving each ETF? Any notable movers?
+4. Economic calendar — any upcoming high-impact events? How could they affect this portfolio?
+5. Technical signals — what are the aggregate buy/sell indicators saying? Any key support/resistance levels?
+6. Insider/Congressional — any notable insider or congressional trading activity?
+7. Social sentiment — any unusual Reddit/Twitter activity on these holdings?
+8. Upgrades/Downgrades — any recent analyst rating changes?
 
-When you mention a concept (52-week high, relative performance, etc.), briefly
-explain what it means in plain English. Be concise but educational.
+When you mention a concept, briefly explain what it means in plain English. Be concise.
 
 End your report with this exact line format:
 OVERNIGHT_SENTIMENT: X/10
-(1 = very bearish, 5 = neutral, 10 = very bullish, based on overall news tone)
+(1 = very bearish, 5 = neutral, 10 = very bullish, based on overall news/data tone)
 
 {intel_text}"""
 
@@ -262,7 +288,7 @@ OVERNIGHT_SENTIMENT: X/10
 
 
 def quant_agent(state: AgentState) -> dict:
-    """Runs quant analysis, then uses LLM to interpret the numbers."""
+    """Runs quant analysis including Monte Carlo, then uses LLM to interpret."""
     holdings = state["holdings"]
     summary = get_quant_summary(holdings)
     quant_text = format_quant_for_prompt(summary)
@@ -276,6 +302,7 @@ Provide the key metrics and their interpretation:
 3. Sharpe/Sortino ratios and whether they're good
 4. Drawdown — worst drop and recovery time
 5. Backtest — portfolio vs VTI-only approach
+6. Monte Carlo simulation — what are the projected outcomes? What does the probability of loss tell us?
 
 State the numbers, then give a brief plain-English interpretation of each.
 Keep it factual and concise. Do NOT give investment advice.
@@ -289,11 +316,53 @@ Keep it factual and concise. Do NOT give investment advice.
     return {"quant_report": sanitize_response(response.content)}
 
 
+def bull_agent(state: AgentState) -> dict:
+    """Makes the strongest bull case for the portfolio based on available data."""
+    prompt = f"""You are a bull case analyst. Based on the data below, make the STRONGEST
+possible optimistic case for this portfolio over the next 1-3 months.
+
+Use specific data points: positive news, strong technicals, favorable F&G for buying,
+good quant metrics, positive earnings surprises, analyst upgrades, etc.
+
+Be specific and data-driven. No vague optimism — cite numbers from the reports.
+Keep it to 4-6 sentences.
+
+=== DATA === {state['data_report']}
+=== NEWS === {state['news_report']}
+=== QUANT === {state['quant_report']}"""
+
+    response = llm.invoke([
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=prompt),
+    ])
+    return {"bull_report": sanitize_response(response.content)}
+
+
+def bear_agent(state: AgentState) -> dict:
+    """Makes the strongest bear case for the portfolio based on available data."""
+    prompt = f"""You are a bear case analyst. Based on the data below, make the STRONGEST
+possible pessimistic case for this portfolio over the next 1-3 months.
+
+Use specific data points: negative news, weak technicals, high fear readings,
+concentration risk, poor earnings outlook, downgrades, macro headwinds, etc.
+
+Be specific and data-driven. No vague pessimism — cite numbers from the reports.
+Keep it to 4-6 sentences.
+
+=== DATA === {state['data_report']}
+=== NEWS === {state['news_report']}
+=== QUANT === {state['quant_report']}"""
+
+    response = llm.invoke([
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=prompt),
+    ])
+    return {"bear_report": sanitize_response(response.content)}
+
+
 EDUCATOR_RULE = """
 IMPORTANT: The user is 19 and learning to invest. When you mention any financial
-concept, briefly explain it in plain English. For example:
-- "Sharpe ratio of 2.05 (this measures return per unit of risk — above 1 is good,
-  above 2 is excellent)"
+concept, briefly explain it in plain English.
 Don't be condescending — be the smart friend who explains things clearly.
 """
 
@@ -304,8 +373,10 @@ Structure:
 1. Start with yesterday's close for each holding (use the YESTERDAY'S CLOSE data)
 2. State the Fear & Greed reading and the overnight news sentiment score
 3. One sentence outlook for the day based on beta exposure, Fear & Greed, and news
-4. Surface any alerts
+4. Surface any alerts (including drift alerts)
 5. If LAST WEEK P&L data is present (Monday), include it as a single line
+6. If there are upcoming economic events, flag the most important one
+7. Present the bull and bear cases as a "Bulls say / Bears say" two-liner
 
 HARD LIMIT: {MORNING_WORD_LIMIT} words maximum. Be direct.
 {EDUCATOR_RULE}""",
@@ -316,12 +387,11 @@ Rules:
 - Put any ALERTS at the very top, clearly labeled
 - If there are no alerts AND nothing notable is happening, respond with exactly: SILENT
 - Do NOT explain what beta means UNLESS the BIG_MOVE_TICKERS field lists a ticker
-  (only then, briefly note its beta to explain why the move is amplified)
-- Do NOT mention 52-week high/low unless a holding actually broke to a new 52-week
-  high TODAY (current price >= 52-week high in the data)
-- Do NOT repeat Sharpe ratio, Sortino, drawdown, backtest, or correlation data
+- Do NOT mention 52-week high/low unless a holding actually broke to a new 52-week high TODAY
+- Do NOT repeat Sharpe ratio, Sortino, drawdown, backtest, correlation, or Monte Carlo data
 - Do NOT include a disclaimer
 - Focus on: what moved, by how much, why (connect to news if clear)
+- If technical signals are notable (strong buy/sell), mention them briefly
 
 HARD LIMIT: {INTRADAY_WORD_LIMIT} words maximum. Shorter is better.
 {EDUCATOR_RULE}""",
@@ -330,7 +400,8 @@ HARD LIMIT: {INTRADAY_WORD_LIMIT} words maximum. Shorter is better.
 - Start with how much the portfolio made or lost today (total and per-holding attribution)
 - Who was the biggest mover and why (connect to news)
 - Include the Fear & Greed reading
-- Note any alerts
+- Note any alerts (including drift)
+- Present the bull/bear cases as a brief "Bulls say / Bears say" section
 - Keep it to 6-8 sentences.
 {EDUCATOR_RULE}""",
 
@@ -340,19 +411,21 @@ Required sections:
 1. Total week P&L (from WEEKLY STATS)
 2. Best day and worst day (from WEEKLY STATS)
 3. Average Fear & Greed for the week
-4. YOUR MONEY vs MARKET GAINS — show how much was deposited vs how much the market added
+4. YOUR MONEY vs MARKET GAINS — show how much was deposited vs how much the market added. Include dividends if present.
 5. How the portfolio stacks up against just owning VTI (use backtest data)
-6. One paragraph narrative: what drove this week's performance (connect news to moves)
-7. One thing to watch next week based on news trends
+6. Monte Carlo outlook — what does the simulation project? What's the probability of loss?
+7. Bull case vs Bear case — present both sides
+8. One paragraph narrative: what drove this week's performance (connect news to moves, mention technicals)
+9. One thing to watch next week based on news trends and economic calendar
 
-Note any ongoing alerts (concentration, sustained fear).
-Keep it to 12-15 sentences.
+Note any ongoing alerts (concentration, sustained fear, drift).
+Keep it to 15-18 sentences.
 {EDUCATOR_RULE}""",
 
     "interactive": f"""The user asked a question about their portfolio. They are 19 and
 learning to invest.
 
-Answer their question directly using the data, news, and quant analysis provided.
+Answer their question directly using the data, news, quant analysis, and bull/bear perspectives.
 If they ask about a concept, explain it clearly with examples from their own portfolio.
 If the question is about something not covered in the data, say so.
 Be concise but don't skip the explanation — this is how they learn.
@@ -382,17 +455,50 @@ def synthesis_agent(state: AgentState) -> dict:
 === QUANT REPORT ===
 {state['quant_report']}
 
+=== BULL CASE ===
+{state['bull_report']}
+
+=== BEAR CASE ===
+{state['bear_report']}
+
 Rules:
 - Use specific numbers from the reports. Never fabricate.
 - Connect news to price moves when the link is clear.
 - If there are alerts, always mention them — they're important.
-- Never recommend buying, selling, or holding."""
+- If RECENT DECISION MEMORY is present, reference it to show awareness of past context.
+- Never recommend buying, selling, or holding.
+
+After your response, add a final line starting with "TAKEAWAY:" followed by
+a single sentence summary of the most important insight from this briefing.
+This will be stored for future context."""
 
     response = llm.invoke([
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=prompt),
     ])
-    return {"synthesis": sanitize_response(response.content)}
+
+    full_response = sanitize_response(response.content)
+
+    # Extract and store takeaway for decision memory
+    takeaway = ""
+    if "TAKEAWAY:" in full_response:
+        parts = full_response.split("TAKEAWAY:", 1)
+        takeaway = parts[1].strip().split("\n")[0].strip()
+        # Remove the TAKEAWAY line from the user-facing message
+        full_response = parts[0].strip()
+
+    if takeaway:
+        # Get current portfolio value from data report
+        portfolio_value = None
+        for line in state["data_report"].split("\n"):
+            if line.startswith("Total: $"):
+                try:
+                    portfolio_value = float(line.split("$")[1].split(" ")[0].replace(",", ""))
+                except (ValueError, IndexError):
+                    pass
+        store_decision_memory(mode, takeaway, portfolio_value)
+
+    return {"synthesis": full_response}
 
 
 # --- Build Graph ---
@@ -403,15 +509,27 @@ def build_graph():
     graph.add_node("data_agent", data_agent)
     graph.add_node("news_agent", news_agent)
     graph.add_node("quant_agent", quant_agent)
+    graph.add_node("bull_agent", bull_agent)
+    graph.add_node("bear_agent", bear_agent)
     graph.add_node("synthesis_agent", synthesis_agent)
 
+    # Phase 1: data + news + quant in parallel
     graph.add_edge(START, "data_agent")
     graph.add_edge(START, "news_agent")
     graph.add_edge(START, "quant_agent")
 
-    graph.add_edge("data_agent", "synthesis_agent")
-    graph.add_edge("news_agent", "synthesis_agent")
-    graph.add_edge("quant_agent", "synthesis_agent")
+    # Phase 2: bull + bear in parallel (wait for all phase 1)
+    graph.add_edge("data_agent", "bull_agent")
+    graph.add_edge("news_agent", "bull_agent")
+    graph.add_edge("quant_agent", "bull_agent")
+
+    graph.add_edge("data_agent", "bear_agent")
+    graph.add_edge("news_agent", "bear_agent")
+    graph.add_edge("quant_agent", "bear_agent")
+
+    # Phase 3: synthesis (waits for bull + bear)
+    graph.add_edge("bull_agent", "synthesis_agent")
+    graph.add_edge("bear_agent", "synthesis_agent")
 
     graph.add_edge("synthesis_agent", END)
 
@@ -430,6 +548,8 @@ def run_agents(mode, question=""):
         "data_report": "",
         "news_report": "",
         "quant_report": "",
+        "bull_report": "",
+        "bear_report": "",
         "synthesis": "",
     })
     return result["synthesis"]
