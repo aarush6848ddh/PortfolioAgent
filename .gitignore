@@ -1,6 +1,26 @@
+# Secrets
 .env
+.env.*
+*.key
+*.pem
+
+# Python
 __pycache__/
 *.pyc
 venv/
 .venv/
-bot.log
+
+# Logs
+*.log
+/tmp/
+
+# Dashboard (Next.js)
+dashboard/node_modules/
+dashboard/.next/
+dashboard/.env*
+
+# OS
+.DS_Store
+
+# Claude
+.claude/

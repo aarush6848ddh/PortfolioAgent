@@ -14,7 +14,7 @@ fi
 
 echo "Starting bot..."
 cd /home/aarushs684/portfolioagent
-nohup bash run_bot.sh &
+nohup bash scripts/run_bot.sh &
 sleep 2
 
 if pgrep -f "python.*bot.py" > /dev/null; then
