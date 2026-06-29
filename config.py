@@ -17,7 +17,7 @@ FEAR_THRESHOLD = int(os.environ.get("FEAR_THRESHOLD", "30"))
 FEAR_SUSTAINED_DAYS = int(os.environ.get("FEAR_SUSTAINED_DAYS", "5"))
 
 # Message word limits
-INTRADAY_WORD_LIMIT = int(os.environ.get("INTRADAY_WORD_LIMIT", "100"))
+INTRADAY_WORD_LIMIT = int(os.environ.get("INTRADAY_WORD_LIMIT", "80"))
 MORNING_WORD_LIMIT = int(os.environ.get("MORNING_WORD_LIMIT", "150"))
 
 # Drift detection threshold (% deviation from target allocation)

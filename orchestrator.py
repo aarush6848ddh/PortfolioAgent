@@ -109,14 +109,16 @@ def data_agent(state: AgentState) -> dict:
         pl = value - cost
         pl_pct = (price - h["cost_basis"]) / h["cost_basis"] * 100
 
-        streak_str = f"{abs(streak)}-day {'up' if streak > 0 else 'down'} streak" if streak != 0 else "no streak"
-
         parts = [
             f"{h['ticker']}: {h['shares']} shares @ ${h['cost_basis']:.2f}",
             f"now ${price:.2f}",
             f"P&L: ${pl:.2f} ({pl_pct:+.1f}%)",
-            streak_str,
         ]
+
+        # Only report streaks of 3+ consecutive days
+        if abs(streak) >= 3:
+            streak_str = f"{abs(streak)}-day {'up' if streak > 0 else 'down'} streak"
+            parts.append(streak_str)
 
         if quote:
             parts.append(f"today: {quote['change_pct']:+.2f}%")
@@ -195,6 +197,11 @@ def data_agent(state: AgentState) -> dict:
     else:
         lines.append(f"\nBIG_MOVE_TICKERS: NONE")
 
+    # Beta explanation flag — only explain beta when SOXX moves > 3% in a day
+    soxx_quote = next((get_finnhub_quote(h["ticker"]) for h in holdings if h["ticker"] == "SOXX"), None)
+    beta_explain = soxx_quote and abs(soxx_quote["change_pct"]) > 3.0
+    lines.append(f"\nBETA_EXPLAIN: {'YES' if beta_explain else 'NO'}")
+
     # Fear & Greed Index
     fg = get_fear_greed()
     lines.append(f"\n{format_fear_greed(fg)}")
@@ -216,19 +223,32 @@ def data_agent(state: AgentState) -> dict:
 
     # --- Mode-specific sections ---
 
-    # Morning: yesterday's close + Monday last-week P&L
+    # Morning: yesterday's close only (weekly summary moved to Friday EOD)
     if mode == "morning":
         yesterday = get_yesterday_closes([h["ticker"] for h in holdings])
         if yesterday:
             lines.append("\n=== YESTERDAY'S CLOSE ===")
             for ticker, data in yesterday.items():
                 lines.append(f"  {ticker}: ${data['price']:.2f} ({data['date']})")
-        if datetime.now(ET).weekday() == 0:
-            last_week = get_last_week_snapshots()
-            if last_week:
-                week_pl = sum(s["day_pl"] for s in last_week)
-                lines.append(f"\n=== LAST WEEK P&L ===")
-                lines.append(f"  Total: ${week_pl:+.2f} over {len(last_week)} trading days")
+
+    # Friday EOD: weekly stats for the dedicated Friday digest
+    if mode == "friday_eod":
+        fg_score = fg["score"] if fg else None
+        store_daily_snapshot(total_value, total_cost, total_day_pl, fg_score)
+        snapshots = get_weekly_snapshots()
+        if snapshots:
+            week_pl = sum(s["day_pl"] for s in snapshots)
+            best_day = max(snapshots, key=lambda s: s["day_pl"])
+            worst_day = min(snapshots, key=lambda s: s["day_pl"])
+            fg_scores = [s["fg_score"] for s in snapshots if s["fg_score"] is not None]
+            avg_fg = round(sum(fg_scores) / len(fg_scores), 1) if fg_scores else None
+
+            lines.append(f"\n=== WEEKLY STATS ===")
+            lines.append(f"  Week P&L: ${week_pl:+.2f}")
+            lines.append(f"  Best day: {best_day['date']} (${best_day['day_pl']:+.2f})")
+            lines.append(f"  Worst day: {worst_day['date']} (${worst_day['day_pl']:+.2f})")
+            if avg_fg:
+                lines.append(f"  Average Fear & Greed: {avg_fg}/100")
 
     # Daily: store snapshot
     if mode == "daily":
@@ -403,9 +423,10 @@ Structure:
 2. State the Fear & Greed reading and the overnight news sentiment score
 3. One sentence outlook for the day based on beta exposure, Fear & Greed, and news
 4. Surface any alerts (including drift alerts)
-5. If LAST WEEK P&L data is present (Monday), include it as a single line
-6. If there are upcoming economic events, flag the most important one
-7. Present the bull and bear cases as a "Bulls say / Bears say" two-liner
+5. If there are upcoming economic events, flag the most important one
+6. Present the bull and bear cases as a "Bulls say / Bears say" two-liner
+
+BETA RULE: Only explain what beta means (e.g. "moves 2.4x the market") if BETA_EXPLAIN is YES. Otherwise just state the beta number without explanation.
 
 HARD LIMIT: {MORNING_WORD_LIMIT} words maximum. Be direct.
 {EDUCATOR_RULE}""",
@@ -415,14 +436,27 @@ HARD LIMIT: {MORNING_WORD_LIMIT} words maximum. Be direct.
 Rules:
 - Put any ALERTS at the very top, clearly labeled
 - If there are no alerts AND nothing notable is happening, respond with exactly: SILENT
-- Do NOT explain what beta means UNLESS the BIG_MOVE_TICKERS field lists a ticker
+- Do NOT explain what beta means UNLESS BETA_EXPLAIN is YES. You may state the beta number, but do NOT add any explanation like "moves X times the market" unless BETA_EXPLAIN is YES.
 - Do NOT mention 52-week high/low unless a holding actually broke to a new 52-week high TODAY
 - Do NOT repeat Sharpe ratio, Sortino, drawdown, backtest, correlation, or Monte Carlo data
 - Do NOT include a disclaimer
+- Do NOT include any "Bulls say / Bears say" section — intraday messages are facts only, no narrative framing
 - Focus on: what moved, by how much, why (connect to news if clear)
 - If technical signals are notable (strong buy/sell), mention them briefly
 
 HARD LIMIT: {INTRADAY_WORD_LIMIT} words maximum. Shorter is better.
+{EDUCATOR_RULE}""",
+
+    "friday_eod": f"""It's Friday after market close. Synthesize the weekly P&L digest.
+
+This is a dedicated weekly summary. Include ONLY:
+1. Total week P&L (from WEEKLY STATS)
+2. Best day of the week and worst day of the week (from WEEKLY STATS)
+3. Average Fear & Greed for the week
+4. A 2-sentence narrative: what drove the week's performance and one thing to watch next week
+
+Do NOT include bulls/bears, quant metrics, Monte Carlo, or individual holding breakdowns.
+Keep it tight — this is a recap, not a briefing.
 {EDUCATOR_RULE}""",
 
     "daily": f"""It's end of day. Synthesize a daily summary:
@@ -526,6 +560,20 @@ This will be stored for future context."""
                 except (ValueError, IndexError):
                     pass
         store_decision_memory(mode, takeaway, portfolio_value)
+
+    # Enforce hard word cap for intraday messages via LLM summarization
+    if mode == "intraday" and len(full_response.split()) > INTRADAY_WORD_LIMIT:
+        log.info(f"Intraday message is {len(full_response.split())} words, summarizing to {INTRADAY_WORD_LIMIT}")
+        compress_prompt = (
+            f"Rewrite this market update in {INTRADAY_WORD_LIMIT} words or fewer. "
+            f"Keep all alerts, numbers, and ticker names. Cut filler and explanations. "
+            f"Do not add new information.\n\n{full_response}"
+        )
+        compressed = llm_invoke_with_retry([
+            SystemMessage(content="You are a concise financial editor. Output only the rewritten text."),
+            HumanMessage(content=compress_prompt),
+        ])
+        full_response = sanitize_response(compressed.content)
 
     return {"synthesis": full_response}
 

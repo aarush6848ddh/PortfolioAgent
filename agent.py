@@ -1,10 +1,11 @@
 """Portfolio intelligence agent — entry point for cron jobs.
 
 Modes:
-  --morning   Pre-market briefing (8:55 AM ET) — includes disclaimer
-  (default)   Intraday check (every 30 min during market hours)
-  --summary   End-of-day summary (4:05 PM ET)
-  --weekly    Weekend digest (Friday after close / Saturday 9 AM ET)
+  --morning    Pre-market briefing (8:55 AM ET) — includes disclaimer
+  (default)    Intraday check (every 30 min during market hours)
+  --summary    End-of-day summary (4:05 PM ET)
+  --friday     Friday EOD weekly P&L digest (4:35 PM ET Friday)
+  --weekly     Weekend digest (Saturday 9 AM ET) — full report with charts
 """
 import sys
 import logging
@@ -47,6 +48,12 @@ def daily_summary():
     send_message(response, disclaimer=False)
 
 
+def friday_eod():
+    response = run_agents("friday_eod")
+    log_run("friday_eod", "multi-agent pipeline", response, True, "friday eod digest always sent")
+    send_message(f"Weekly P&L Digest\n\n{response}", disclaimer=False)
+
+
 def weekly_digest():
     response = run_agents("weekly")
     log_run("weekly", "multi-agent pipeline", response, True, "weekly digest always sent")
@@ -70,6 +77,8 @@ if __name__ == "__main__":
         morning_briefing()
     elif mode == "--summary":
         daily_summary()
+    elif mode == "--friday":
+        friday_eod()
     elif mode == "--weekly":
         weekly_digest()
     else:
