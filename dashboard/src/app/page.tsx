@@ -162,19 +162,29 @@ export default function Terminal() {
     });
   }
 
+
+  function renderMarkdown(text: string) {
+    const parts = text.split(/(\*\*[^*]+\*\*)/g);
+    return parts.map((part, i) => {
+      const bold = part.match(/^\*\*(.+)\*\*$/);
+      if (bold) return <strong key={i} className="text-bb-white font-semibold">{bold[1]}</strong>;
+      return <span key={i}>{part}</span>;
+    });
+  }
+
   return (
     <div className="flex min-h-screen flex-col bg-bb-black fade-in">
       {error && <ErrorBanner error={error} />}
 
       {/* ═══ TOP BAR ═══ */}
-      <div className="flex items-center border-b border-bb-border bg-bb-panel">
+      <div className="flex flex-wrap items-center border-b border-bb-border bg-bb-panel">
         <div className="flex items-center gap-2 border-r border-bb-border px-4 py-2">
           <div className="h-3 w-3 bg-bb-amber" />
           <span className="text-sm font-bold text-bb-amber tracking-wider">
             PORTFOLIOAGENT
           </span>
         </div>
-        <div className="flex flex-1 items-center gap-6 px-4">
+        <div className="flex flex-1 items-center gap-6 px-4 overflow-x-auto">
           {holdings.map((h) => (
             <div key={h.ticker} className="flex items-center gap-3">
               <span className="font-semibold text-bb-white">{h.ticker}</span>
@@ -208,7 +218,7 @@ export default function Terminal() {
       </div>
 
       {/* ═══ METRICS STRIP ═══ */}
-      <div className="flex border-b border-bb-border">
+      <div className="flex flex-wrap border-b border-bb-border">
         {[
           {
             label: 'Total Value',
@@ -247,7 +257,7 @@ export default function Terminal() {
               : 'text-bb-gray',
           },
         ].map((m) => (
-          <div key={m.label} className="bb-metric flex-1">
+          <div key={m.label} className="bb-metric flex-1 min-w-[120px]">
             <div className="bb-metric-label">{m.label}</div>
             <div className="bb-metric-value">{m.value}</div>
             <div className={`bb-metric-sub ${m.subColor}`}>{m.sub}</div>
@@ -256,9 +266,9 @@ export default function Terminal() {
       </div>
 
       {/* ═══ MAIN GRID ═══ */}
-      <div className="grid grid-cols-12 border-b border-bb-border">
+      <div className="grid grid-cols-1 lg:grid-cols-12 border-b border-bb-border">
         {/* ─── Portfolio Chart (left 7 cols) ─── */}
-        <div className="col-span-7 border-r border-bb-border">
+        <div className="lg:col-span-7 lg:border-r border-b lg:border-b-0 border-bb-border">
           <Header>
             Portfolio Value &mdash; {snapshots.length}D
           </Header>
@@ -335,10 +345,10 @@ export default function Terminal() {
         </div>
 
         {/* ─── Holdings + Allocation (right 5 cols) ─── */}
-        <div className="col-span-5 flex flex-col">
+        <div className="lg:col-span-5 flex flex-col">
           <div className="flex-1">
             <Header>Holdings</Header>
-            <table className="bb-table w-full">
+            <div className="overflow-x-auto"><table className="bb-table w-full">
               <thead>
                 <tr>
                   <th>Ticker</th>
@@ -395,7 +405,7 @@ export default function Terminal() {
                   </tr>
                 ))}
               </tbody>
-            </table>
+            </table></div>
           </div>
 
           {/* Allocation */}
@@ -483,7 +493,7 @@ export default function Terminal() {
       {/* ═══ QUANT METRICS ═══ */}
       {quantMetrics && (
         <div className="border-b border-bb-border">
-          <div className="flex">
+          <div className="flex flex-wrap">
             {[
               {
                 label: 'Sharpe',
@@ -522,7 +532,7 @@ export default function Terminal() {
                 subColor: 'text-bb-amber',
               },
             ].map((m) => (
-              <div key={m.label} className="bb-metric flex-1">
+              <div key={m.label} className="bb-metric flex-1 min-w-[120px]">
                 <div className="bb-metric-label">{m.label}</div>
                 <div className="bb-metric-value">{m.value}</div>
                 <div className={`bb-metric-sub ${m.subColor}`}>{m.sub}</div>
@@ -564,9 +574,9 @@ export default function Terminal() {
       )}
 
       {/* ═══ AGENT REPORTS ═══ */}
-      <div className="grid grid-cols-12 border-b border-bb-border">
+      <div className="grid grid-cols-1 lg:grid-cols-12 border-b border-bb-border">
         {/* Morning Report */}
-        <div className="col-span-6 border-r border-bb-border">
+        <div className="lg:col-span-6 lg:border-r border-b lg:border-b-0 border-bb-border">
           <Header>
             {'\u25C6'} Morning Briefing
             {morningReport && (
@@ -576,12 +586,12 @@ export default function Terminal() {
             )}
           </Header>
           <div className="p-3 text-[11px] leading-relaxed text-bb-gray max-h-48 overflow-y-auto whitespace-pre-wrap">
-            {morningReport?.response || 'No morning report yet'}
+            {renderMarkdown(morningReport?.response || 'No morning report yet')}
           </div>
         </div>
 
         {/* Latest Intraday */}
-        <div className="col-span-6">
+        <div className="lg:col-span-6">
           <Header variant="orange">
             {'\u25C6'} Latest Update
             {latestReport && (
@@ -592,15 +602,15 @@ export default function Terminal() {
             )}
           </Header>
           <div className="p-3 text-[11px] leading-relaxed text-bb-gray max-h-48 overflow-y-auto whitespace-pre-wrap">
-            {latestReport?.response || 'No reports yet'}
+            {renderMarkdown(latestReport?.response || 'No reports yet')}
           </div>
         </div>
       </div>
 
       {/* ═══ WEEKLY + DECISION MEMORY ═══ */}
-      <div className="grid grid-cols-12 border-b border-bb-border flex-1">
+      <div className="grid grid-cols-1 lg:grid-cols-12 border-b border-bb-border flex-1">
         {/* Weekly Report */}
-        <div className="col-span-7 border-r border-bb-border">
+        <div className="lg:col-span-7 lg:border-r border-b lg:border-b-0 border-bb-border">
           <Header variant="dark">
             {'\u25BA'} Weekly Digest
             {weeklyReport && (
@@ -613,12 +623,12 @@ export default function Terminal() {
             )}
           </Header>
           <div className="p-3 text-[11px] leading-relaxed text-bb-gray overflow-y-auto whitespace-pre-wrap">
-            {weeklyReport?.response || 'No weekly report yet'}
+            {renderMarkdown(weeklyReport?.response || 'No weekly report yet')}
           </div>
         </div>
 
         {/* Decision Memory */}
-        <div className="col-span-5">
+        <div className="lg:col-span-5">
           <Header variant="dark">
             Decision Memory &mdash; Last {memories.length}
           </Header>
