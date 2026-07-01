@@ -369,10 +369,20 @@ def get_quant_metrics():
     for t in ticker_weights:
         ticker_weights[t] /= total_value
 
+    # Check if any portfolio tickers have return data
+    port_tickers_with_data = [t for t in portfolio_tickers if t in returns_by_ticker]
+    if not port_tickers_with_data:
+        return {
+            "sharpe_ratio": 0, "sortino_ratio": 0, "beta": 0,
+            "max_drawdown": 0, "max_drawdown_date": None, "recovery_days": None,
+            "annualized_return": 0, "annualized_volatility": 0,
+            "correlation_matrix": {"tickers": [], "matrix": []},
+        }
+
     # Align returns length (use shortest)
     min_len = min(
         len(spy_returns),
-        *(len(returns_by_ticker[t]) for t in portfolio_tickers if t in returns_by_ticker)
+        *(len(returns_by_ticker[t]) for t in port_tickers_with_data)
     )
     spy_ret = spy_returns[-min_len:]
 
