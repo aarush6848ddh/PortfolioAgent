@@ -29,9 +29,6 @@ def get_daily_closes(ticker, lookback_days=365):
     return rows
 
 def get_aligned_returns(tickers, lookback_days=365):
-    if not tickers:
-        return None, None
-
     all_data = {}
     for t in tickers:
         rows = get_daily_closes(t, lookback_days)
@@ -85,9 +82,6 @@ def calc_rolling_correlation(ticker1, ticker2, window=30, lookback_days=365):
 # --- Drawdown ---
 
 def calc_portfolio_drawdown(holdings, lookback_days=365):
-    if not holdings:
-        return None
-
     tickers = [h["ticker"] for h in holdings]
     shares = {h["ticker"]: h["shares"] for h in holdings}
 
@@ -129,9 +123,6 @@ def calc_portfolio_drawdown(holdings, lookback_days=365):
 # --- Risk-adjusted returns ---
 
 def calc_sharpe_sortino(holdings, lookback_days=365):
-    if not holdings:
-        return None
-
     tickers = [h["ticker"] for h in holdings]
     shares = {h["ticker"]: h["shares"] for h in holdings}
 
@@ -166,9 +157,6 @@ def calc_sharpe_sortino(holdings, lookback_days=365):
 # --- Backtest vs VTI baseline ---
 
 def backtest_vs_vti(holdings, lookback_days=365):
-    if not holdings:
-        return None
-
     tickers = [h["ticker"] for h in holdings]
     shares = {h["ticker"]: h["shares"] for h in holdings}
 
@@ -206,9 +194,6 @@ def backtest_vs_vti(holdings, lookback_days=365):
 def monte_carlo_simulation(holdings):
     """Monte Carlo simulation of future portfolio values.
     Returns percentile outcomes and probability of loss."""
-    if not holdings:
-        return None
-
     tickers = [h["ticker"] for h in holdings]
     shares = {h["ticker"]: h["shares"] for h in holdings}
 
@@ -258,14 +243,6 @@ def monte_carlo_simulation(holdings):
 
 def get_quant_summary(holdings):
     tickers = [h["ticker"] for h in holdings]
-
-    if not tickers:
-        return {
-            "betas": {}, "correlations": None,
-            "rolling_corr_soxx_schg": None, "rolling_corr_soxx_vti": None,
-            "drawdown": None, "risk_adjusted": None,
-            "backtest": None, "monte_carlo": None,
-        }
 
     summary = {
         "betas": {},

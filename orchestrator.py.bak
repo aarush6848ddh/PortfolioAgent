@@ -84,9 +84,6 @@ def data_agent(state: AgentState) -> dict:
     holdings = state["holdings"]
     mode = state["mode"]
 
-    if not holdings:
-        return {"data_report": "No positions in portfolio."}
-
     lines = []
     total_value = 0.0
     total_cost = 0.0
@@ -299,9 +296,6 @@ def data_agent(state: AgentState) -> dict:
 def news_agent(state: AgentState) -> dict:
     """Fetches full market intelligence then uses LLM to synthesize."""
     holdings = state["holdings"]
-    if not holdings:
-        return {"news_report": "No holdings to analyze."}
-
     intel_text = get_full_intel(holdings)
 
     tickers = [h["ticker"] for h in holdings]
@@ -336,9 +330,6 @@ OVERNIGHT_SENTIMENT: X/10
 def quant_agent(state: AgentState) -> dict:
     """Runs quant analysis including Monte Carlo, then uses LLM to interpret."""
     holdings = state["holdings"]
-    if not holdings:
-        return {"quant_report": "No holdings to analyze."}
-
     summary = get_quant_summary(holdings)
     quant_text = format_quant_for_prompt(summary)
 
@@ -627,8 +618,6 @@ workflow = build_graph()
 def run_agents(mode, question=""):
     """Run the full multi-agent pipeline. Returns the synthesized response."""
     holdings = get_holdings()
-    if not holdings:
-        return "Portfolio is empty — no positions to analyze. Add a position via Telegram to resume updates."
     result = workflow.invoke({
         "mode": mode,
         "question": question,

@@ -362,9 +362,7 @@ export default function Terminal() {
                 </tr>
               </thead>
               <tbody>
-                {holdings.length === 0 ? (
-                  <tr><td colSpan={8} className="text-center text-bb-gray py-4">No positions — portfolio is empty</td></tr>
-                ) : holdings.map((h) => (
+                {holdings.map((h) => (
                   <tr key={h.ticker}>
                     <td className="!text-left font-semibold text-bb-amber">
                       {h.ticker}
@@ -414,9 +412,7 @@ export default function Terminal() {
           <div className="border-t border-bb-border">
             <Header variant="dark">Allocation</Header>
             <div className="space-y-2 p-3">
-              {holdings.length === 0 ? (
-                <div className="text-[10px] text-bb-gray py-2">NO POSITIONS</div>
-              ) : holdings.map((h, i) => {
+              {holdings.map((h, i) => {
                 const colors = [
                   '#3388ff',
                   '#ff8c00',
@@ -495,7 +491,7 @@ export default function Terminal() {
       </div>
 
       {/* ═══ QUANT METRICS ═══ */}
-      {quantMetrics && quantMetrics.correlation_matrix?.tickers?.length > 0 && (
+      {quantMetrics && (
         <div className="border-b border-bb-border">
           <div className="flex flex-wrap">
             {[
