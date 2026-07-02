@@ -34,8 +34,28 @@ Rules:
 Return ONLY valid JSON. No explanation, no markdown, no code fences."""
 
 
-def _call_groq(messages, model="openai/gpt-oss-120b"):
-    """Make a raw Groq API call and return the response text."""
+import time
+import logging
+
+log = logging.getLogger("trade_parser")
+
+
+def _call_groq(messages, model="openai/gpt-oss-120b", max_retries=3):
+    """Make a raw Groq API call with retry on rate limits."""
+    for attempt in range(max_retries):
+        resp = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "temperature": 0},
+        )
+        if resp.status_code == 429:
+            wait = 10 * (attempt + 1)
+            log.warning(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/{max_retries})")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    # Final attempt
     resp = requests.post(
         GROQ_URL,
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
