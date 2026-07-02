@@ -73,13 +73,24 @@ def weekly_digest():
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "intraday"
 
-    if mode == "--morning":
-        morning_briefing()
-    elif mode == "--summary":
-        daily_summary()
-    elif mode == "--friday":
-        friday_eod()
-    elif mode == "--weekly":
-        weekly_digest()
-    else:
-        intraday_check()
+    try:
+        if mode == "--morning":
+            morning_briefing()
+        elif mode == "--summary":
+            daily_summary()
+        elif mode == "--friday":
+            friday_eod()
+        elif mode == "--weekly":
+            weekly_digest()
+        else:
+            intraday_check()
+    except Exception as e:
+        # Graceful degradation: the failure alert must NOT depend on the LLM
+        # (a Groq rate limit is the most likely cause of failure here).
+        log.exception(f"Agent run failed (mode={mode})")
+        err = f"{type(e).__name__}: {e}"
+        try:
+            send_message(f"Agent run failed ({mode}).\n{err[:500]}", disclaimer=False)
+        except Exception:
+            log.exception("Failed to send failure alert to Telegram")
+        sys.exit(1)
