@@ -95,8 +95,11 @@ def data_agent(state: AgentState) -> dict:
     alerts = []
     big_move_tickers = []
 
+    # Fetch each quote once and reuse (avoids double Finnhub calls per holding)
+    ticker_quotes = {h["ticker"]: get_finnhub_quote(h["ticker"]) for h in holdings}
+
     for h in holdings:
-        quote = get_finnhub_quote(h["ticker"])
+        quote = ticker_quotes[h["ticker"]]
         prev = get_prev_close(h["ticker"])
         streak = get_streak(h["ticker"])
 
@@ -149,7 +152,7 @@ def data_agent(state: AgentState) -> dict:
     alloc = []
     current_alloc = {}
     for h in holdings:
-        q = get_finnhub_quote(h["ticker"])
+        q = ticker_quotes[h["ticker"]]
         p = q["current"] if q else get_prev_close(h["ticker"])
         if p and total_value > 0:
             weight = (p * h["shares"]) / total_value * 100
@@ -201,7 +204,7 @@ def data_agent(state: AgentState) -> dict:
         lines.append(f"\nBIG_MOVE_TICKERS: NONE")
 
     # Beta explanation flag — only explain beta when SOXX moves > 3% in a day
-    soxx_quote = next((get_finnhub_quote(h["ticker"]) for h in holdings if h["ticker"] == "SOXX"), None)
+    soxx_quote = ticker_quotes.get("SOXX")
     beta_explain = soxx_quote and abs(soxx_quote["change_pct"]) > 3.0
     lines.append(f"\nBETA_EXPLAIN: {'YES' if beta_explain else 'NO'}")
 

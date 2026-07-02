@@ -1,15 +1,61 @@
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from api.db import get_db
+import asyncio
+import time
+import logging
+from collections import defaultdict
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+import numpy as np
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+
+from api import quotes, stream
+from api.db import get_db
+from news import get_company_news
+
+log = logging.getLogger("api")
+
+DASHBOARD_ORIGIN = "https://aarush-box.tail8c0a93.ts.net"
+
+
+# --- Rate limiting (per real client IP — Funnel sets X-Forwarded-For) ---
+
+def client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=client_ip, default_limits=["30/minute"])
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(stream.finnhub_stream())
+    yield
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=[DASHBOARD_ORIGIN],
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+
+def get_active_holdings(cur):
+    cur.execute("SELECT ticker, shares, cost_basis FROM holdings WHERE sold_at IS NULL")
+    return cur.fetchall()
 
 
 @app.get("/health")
@@ -19,39 +65,10 @@ def health():
 
 @app.get("/portfolio")
 def get_portfolio():
-    import os
-    import requests
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    # Active holdings
-    cur.execute("SELECT ticker, shares, cost_basis FROM holdings WHERE sold_at IS NULL")
-    holdings_raw = cur.fetchall()
-
-    cur.close()
-    conn.close()
-
-    # Fetch live quotes from Finnhub REST API
-    finnhub_key = os.environ.get("FINNHUB_API_KEY", "")
-    quotes = {}
-    for ticker, _, _ in holdings_raw:
-        if ticker not in quotes:
-            try:
-                r = requests.get(
-                    f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={finnhub_key}",
-                    timeout=5,
-                )
-                data = r.json()
-                if data.get("c"):
-                    quotes[ticker] = {
-                        "current": float(data["c"]),
-                        "prev_close": float(data["pc"]),
-                        "day_change": float(data["d"]) if data.get("d") else 0,
-                        "day_change_pct": float(data["dp"]) if data.get("dp") else 0,
-                    }
-            except Exception:
-                pass
+    with get_db() as conn:
+        cur = conn.cursor()
+        holdings_raw = get_active_holdings(cur)
+        cur.close()
 
     holdings = []
     total_value = 0
@@ -60,7 +77,7 @@ def get_portfolio():
     for ticker, shares, cost_basis in holdings_raw:
         shares = float(shares)
         cost_basis = float(cost_basis)
-        quote = quotes.get(ticker, {})
+        quote = quotes.get_quote(ticker) or {}
         current_price = quote.get("current", cost_basis)
         day_change = quote.get("day_change", 0)
         day_change_pct = quote.get("day_change_pct", 0)
@@ -83,7 +100,6 @@ def get_portfolio():
             "day_change_pct": round(day_change_pct, 2),
         })
 
-    # Compute weights
     for h in holdings:
         h["weight"] = round((h["value"] / total_value) * 100, 2) if total_value else 0
 
@@ -105,37 +121,31 @@ def get_portfolio():
 
 @app.get("/portfolio/history")
 def get_portfolio_history(limit: int = Query(default=90, le=365)):
-    conn = get_db()
-    cur = conn.cursor()
+    with get_db() as conn:
+        cur = conn.cursor()
 
-    # Daily snapshots
-    cur.execute(
-        "SELECT date, total_value, total_cost, day_pl, fear_greed_score "
-        "FROM daily_snapshots ORDER BY date DESC LIMIT %s",
-        (limit,),
-    )
-    snapshot_rows = cur.fetchall()
+        cur.execute(
+            "SELECT date, total_value, total_cost, day_pl, fear_greed_score "
+            "FROM daily_snapshots ORDER BY date DESC LIMIT %s",
+            (limit,),
+        )
+        snapshot_rows = cur.fetchall()
 
-    # Also get daily closes to compute historical value if snapshots are sparse
-    cur.execute("""
-        SELECT dc.date, dc.ticker, dc.close_price
-        FROM daily_closes dc
-        WHERE dc.ticker IN (SELECT DISTINCT ticker FROM holdings WHERE sold_at IS NULL)
-        ORDER BY dc.date DESC
-        LIMIT %s
-    """, (limit * 10,))
-    close_rows = cur.fetchall()
+        # Also get daily closes to compute historical value if snapshots are sparse
+        cur.execute("""
+            SELECT dc.date, dc.ticker, dc.close_price
+            FROM daily_closes dc
+            WHERE dc.ticker IN (SELECT DISTINCT ticker FROM holdings WHERE sold_at IS NULL)
+            ORDER BY dc.date DESC
+            LIMIT %s
+        """, (limit * 10,))
+        close_rows = cur.fetchall()
 
-    # Get active holdings for historical calc
-    cur.execute("SELECT ticker, shares, cost_basis FROM holdings WHERE sold_at IS NULL")
-    active = [(r[0], float(r[1]), float(r[2])) for r in cur.fetchall()]
-
-    cur.close()
-    conn.close()
+        active = [(r[0], float(r[1]), float(r[2])) for r in get_active_holdings(cur)]
+        cur.close()
 
     # Build history from daily_closes if snapshots are sparse
     if len(snapshot_rows) < 5 and close_rows:
-        from collections import defaultdict
         by_date = defaultdict(dict)
         for date, ticker, close in close_rows:
             by_date[date.isoformat()][ticker] = float(close)
@@ -147,7 +157,6 @@ def get_portfolio_history(limit: int = Query(default=90, le=365)):
         for date_str in sorted_dates:
             prices = by_date[date_str]
             total_val = sum(shares * prices.get(t, cb) for t, shares, cb in active)
-            total_cost = sum(shares * cb for _, shares, cb in active)
             day_pnl = (total_val - prev_value) if prev_value else 0
             cumulative_pnl += day_pnl
             prev_value = total_val
@@ -159,7 +168,6 @@ def get_portfolio_history(limit: int = Query(default=90, le=365)):
             })
         return {"snapshots": snapshots[-limit:]}
 
-    # Use actual snapshots
     snapshots = []
     cumulative = 0
     for r in reversed(snapshot_rows):
@@ -176,12 +184,11 @@ def get_portfolio_history(limit: int = Query(default=90, le=365)):
 
 @app.get("/fear-greed")
 def get_fear_greed():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT date, score, rating FROM fear_greed_history ORDER BY date DESC LIMIT 30")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT date, score, rating FROM fear_greed_history ORDER BY date DESC LIMIT 30")
+        rows = cur.fetchall()
+        cur.close()
 
     if not rows:
         return {"value": 0, "label": "N/A", "history": []}
@@ -199,33 +206,28 @@ def get_fear_greed():
 
 @app.get("/portfolio/analysis")
 def get_portfolio_analysis():
-    conn = get_db()
-    cur = conn.cursor()
+    with get_db() as conn:
+        cur = conn.cursor()
 
-    # Latest reports by type
-    cur.execute(
-        "SELECT run_type, response, created_at FROM agent_logs "
-        "WHERE run_type IN ('morning', 'daily', 'intraday', 'weekly') "
-        "ORDER BY created_at DESC LIMIT 1"
-    )
-    latest = cur.fetchone()
+        cur.execute(
+            "SELECT run_type, response, created_at FROM agent_logs "
+            "WHERE run_type IN ('morning', 'daily', 'intraday', 'weekly') "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        latest = cur.fetchone()
 
-    # Latest morning report (usually has bull/bear)
-    cur.execute(
-        "SELECT run_type, response, created_at FROM agent_logs "
-        "WHERE run_type = 'morning' ORDER BY created_at DESC LIMIT 1"
-    )
-    morning = cur.fetchone()
+        cur.execute(
+            "SELECT run_type, response, created_at FROM agent_logs "
+            "WHERE run_type = 'morning' ORDER BY created_at DESC LIMIT 1"
+        )
+        morning = cur.fetchone()
 
-    # Decision memory
-    cur.execute(
-        "SELECT date, run_type, takeaways, portfolio_value FROM decision_memory "
-        "ORDER BY date DESC, created_at DESC LIMIT 5"
-    )
-    memories = cur.fetchall()
-
-    cur.close()
-    conn.close()
+        cur.execute(
+            "SELECT date, run_type, takeaways, portfolio_value FROM decision_memory "
+            "ORDER BY date DESC, created_at DESC LIMIT 5"
+        )
+        memories = cur.fetchall()
+        cur.close()
 
     def to_report(row):
         if not row:
@@ -253,23 +255,21 @@ def get_portfolio_analysis():
 
 @app.get("/portfolio/quant")
 def get_portfolio_quant():
-    conn = get_db()
-    cur = conn.cursor()
+    with get_db() as conn:
+        cur = conn.cursor()
 
-    cur.execute(
-        "SELECT run_type, response, created_at FROM agent_logs "
-        "WHERE run_type = 'weekly' ORDER BY created_at DESC LIMIT 1"
-    )
-    weekly = cur.fetchone()
+        cur.execute(
+            "SELECT run_type, response, created_at FROM agent_logs "
+            "WHERE run_type = 'weekly' ORDER BY created_at DESC LIMIT 1"
+        )
+        weekly = cur.fetchone()
 
-    cur.execute(
-        "SELECT run_type, response, created_at FROM agent_logs "
-        "WHERE run_type = 'morning' ORDER BY created_at DESC LIMIT 1"
-    )
-    morning = cur.fetchone()
-
-    cur.close()
-    conn.close()
+        cur.execute(
+            "SELECT run_type, response, created_at FROM agent_logs "
+            "WHERE run_type = 'morning' ORDER BY created_at DESC LIMIT 1"
+        )
+        morning = cur.fetchone()
+        cur.close()
 
     def to_dict(row):
         if not row:
@@ -282,158 +282,114 @@ def get_portfolio_quant():
     }
 
 
+EMPTY_QUANT_METRICS = {
+    "sharpe_ratio": 0, "sortino_ratio": 0, "beta": 0,
+    "max_drawdown": 0, "max_drawdown_date": None, "recovery_days": None,
+    "annualized_return": 0, "annualized_volatility": 0,
+    "correlation_matrix": {"tickers": [], "matrix": []},
+}
+
+
 @app.get("/portfolio/quant-metrics")
 def get_quant_metrics():
-    import numpy as np
-    from collections import defaultdict
+    with get_db() as conn:
+        cur = conn.cursor()
 
-    conn = get_db()
-    cur = conn.cursor()
+        cur.execute("SELECT DISTINCT ticker FROM holdings WHERE sold_at IS NULL")
+        portfolio_tickers = [r[0] for r in cur.fetchall()]
 
-    # Get active tickers
-    cur.execute("SELECT DISTINCT ticker FROM holdings WHERE sold_at IS NULL")
-    portfolio_tickers = [r[0] for r in cur.fetchall()]
+        if not portfolio_tickers:
+            cur.close()
+            return EMPTY_QUANT_METRICS
 
-    if not portfolio_tickers:
-        return {
-            "sharpe_ratio": 0, "sortino_ratio": 0, "beta": 0,
-            "max_drawdown": 0, "max_drawdown_date": None, "recovery_days": None,
-            "annualized_return": 0, "annualized_volatility": 0,
-            "correlation_matrix": {"tickers": [], "matrix": []},
-        }
+        all_tickers = list(set(portfolio_tickers + ["SPY"]))
 
-    # All tickers we need (portfolio + SPY benchmark)
-    all_tickers = list(set(portfolio_tickers + ["SPY"]))
+        cur.execute(
+            "SELECT ticker, date, close_price FROM daily_closes "
+            "WHERE ticker = ANY(%s) ORDER BY date",
+            (all_tickers,),
+        )
+        rows = cur.fetchall()
 
-    # Get daily closes
-    cur.execute(
-        "SELECT ticker, date, close_price FROM daily_closes "
-        "WHERE ticker = ANY(%s) ORDER BY date",
-        (all_tickers,),
-    )
-    rows = cur.fetchall()
+        holdings = [(r[0], float(r[1]), float(r[2])) for r in get_active_holdings(cur)]
+        cur.close()
 
-    # Get holdings for portfolio weighting
-    cur.execute("SELECT ticker, shares, cost_basis FROM holdings WHERE sold_at IS NULL")
-    holdings = [(r[0], float(r[1]), float(r[2])) for r in cur.fetchall()]
-
-    cur.close()
-    conn.close()
-
-    # Organize prices by ticker
-    prices_by_ticker = defaultdict(list)
+    closes = defaultdict(dict)
     for ticker, date, close in rows:
-        prices_by_ticker[ticker].append((date, float(close)))
+        closes[ticker][date] = float(close)
 
-    # Sort by date
-    for t in prices_by_ticker:
-        prices_by_ticker[t].sort(key=lambda x: x[0])
+    port_tickers_with_data = [t for t in portfolio_tickers if len(closes.get(t, {})) >= 2]
+    if not port_tickers_with_data or len(closes.get("SPY", {})) < 2:
+        return EMPTY_QUANT_METRICS
 
-    # Compute daily returns per ticker
+    # Align all series on dates where every ticker traded, so returns
+    # are computed for the same day across tickers (mixed history lengths
+    # or holiday gaps would otherwise skew beta/correlations).
+    common_dates = sorted(
+        set.intersection(*(set(closes[t]) for t in port_tickers_with_data + ["SPY"]))
+    )
+    if len(common_dates) < 2:
+        return EMPTY_QUANT_METRICS
+
     returns_by_ticker = {}
-    for t, price_series in prices_by_ticker.items():
-        prices = np.array([p[1] for p in price_series])
-        if len(prices) < 2:
-            continue
+    for t in port_tickers_with_data + ["SPY"]:
+        prices = np.array([closes[t][d] for d in common_dates])
         returns_by_ticker[t] = np.diff(prices) / prices[:-1]
 
-    if not returns_by_ticker or "SPY" not in returns_by_ticker:
-        return {
-            "sharpe_ratio": 0, "sortino_ratio": 0, "beta": 0,
-            "max_drawdown": 0, "max_drawdown_date": None, "recovery_days": None,
-            "annualized_return": 0, "annualized_volatility": 0,
-            "correlation_matrix": {"tickers": [], "matrix": []},
-        }
+    spy_ret = returns_by_ticker["SPY"]
 
-    spy_returns = returns_by_ticker["SPY"]
-
-    # Compute portfolio-weighted daily returns
-    # Use latest prices for weights
+    # Portfolio-weighted daily returns (latest prices for weights)
     total_value = 0
     ticker_weights = {}
     for t, shares, _ in holdings:
-        if t in prices_by_ticker:
-            latest_price = prices_by_ticker[t][-1][1]
-            val = shares * latest_price
+        if t in returns_by_ticker:
+            val = shares * closes[t][common_dates[-1]]
             ticker_weights[t] = val
             total_value += val
 
     if total_value == 0:
-        return {
-            "sharpe_ratio": 0, "sortino_ratio": 0, "beta": 0,
-            "max_drawdown": 0, "max_drawdown_date": None, "recovery_days": None,
-            "annualized_return": 0, "annualized_volatility": 0,
-            "correlation_matrix": {"tickers": [], "matrix": []},
-        }
+        return EMPTY_QUANT_METRICS
 
     for t in ticker_weights:
         ticker_weights[t] /= total_value
 
-    # Check if any portfolio tickers have return data
-    port_tickers_with_data = [t for t in portfolio_tickers if t in returns_by_ticker]
-    if not port_tickers_with_data:
-        return {
-            "sharpe_ratio": 0, "sortino_ratio": 0, "beta": 0,
-            "max_drawdown": 0, "max_drawdown_date": None, "recovery_days": None,
-            "annualized_return": 0, "annualized_volatility": 0,
-            "correlation_matrix": {"tickers": [], "matrix": []},
-        }
-
-    # Align returns length (use shortest)
-    min_len = min(
-        len(spy_returns),
-        *(len(returns_by_ticker[t]) for t in port_tickers_with_data)
-    )
-    spy_ret = spy_returns[-min_len:]
-
-    port_returns = np.zeros(min_len)
-    for t in portfolio_tickers:
-        if t in returns_by_ticker and t in ticker_weights:
-            port_returns += ticker_weights[t] * returns_by_ticker[t][-min_len:]
+    port_returns = np.zeros(len(spy_ret))
+    for t, weight in ticker_weights.items():
+        port_returns += weight * returns_by_ticker[t]
 
     # --- Metrics ---
     rf_daily = 0.05 / 252  # 5% risk-free rate
 
-    # Sharpe ratio (annualized)
     excess = port_returns - rf_daily
     sharpe = float(np.mean(excess) / np.std(excess) * np.sqrt(252)) if np.std(excess) > 0 else 0
 
-    # Sortino ratio (annualized)
     downside = excess[excess < 0]
     downside_std = np.std(downside) if len(downside) > 0 else 1e-10
     sortino = float(np.mean(excess) / downside_std * np.sqrt(252))
 
-    # Beta vs SPY
     cov = np.cov(port_returns, spy_ret)
     beta = float(cov[0, 1] / cov[1, 1]) if cov[1, 1] > 0 else 1.0
 
-    # Max drawdown
     cum_returns = np.cumprod(1 + port_returns)
     running_max = np.maximum.accumulate(cum_returns)
     drawdowns = (cum_returns - running_max) / running_max
     max_dd = float(np.min(drawdowns) * 100)
 
-    # Find max drawdown date
     dd_idx = int(np.argmin(drawdowns))
-    dates = [p[0] for p in prices_by_ticker[portfolio_tickers[0]]]
-    max_dd_date = dates[min(dd_idx + 1, len(dates) - 1)].isoformat() if dates else None
+    # returns[i] corresponds to common_dates[i + 1]
+    max_dd_date = common_dates[min(dd_idx + 1, len(common_dates) - 1)].isoformat()
 
-    # Recovery: days from max DD to new high
     recovery_days = None
     if dd_idx < len(drawdowns) - 1:
         recovery = np.where(drawdowns[dd_idx:] >= 0)[0]
         if len(recovery) > 0:
             recovery_days = int(recovery[0])
 
-    # Annualized return & volatility
     ann_return = float((cum_returns[-1] ** (252 / len(port_returns)) - 1) * 100)
     ann_vol = float(np.std(port_returns) * np.sqrt(252) * 100)
 
-    # Correlation matrix (portfolio tickers + SPY)
-    corr_tickers = [t for t in portfolio_tickers if t in returns_by_ticker] + ["SPY"]
-    corr_returns = []
-    for t in corr_tickers:
-        corr_returns.append(returns_by_ticker[t][-min_len:])
+    corr_tickers = port_tickers_with_data + ["SPY"]
+    corr_returns = [returns_by_ticker[t] for t in corr_tickers]
     corr_matrix = np.corrcoef(corr_returns).tolist()
 
     return {
@@ -450,3 +406,85 @@ def get_quant_metrics():
             "matrix": [[round(v, 3) for v in row] for row in corr_matrix],
         },
     }
+
+
+# --- Sparklines (last 30 closes per ticker, cached 10 min) ---
+
+_sparklines_cache = {"expires": 0.0, "data": None}
+
+
+@app.get("/portfolio/sparklines")
+def get_sparklines():
+    if _sparklines_cache["data"] is not None and _sparklines_cache["expires"] > time.time():
+        return _sparklines_cache["data"]
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ticker, date, close_price FROM (
+                SELECT ticker, date, close_price,
+                       ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
+                FROM daily_closes
+                WHERE ticker IN (SELECT DISTINCT ticker FROM holdings WHERE sold_at IS NULL)
+                   OR ticker = 'SPY'
+            ) t WHERE rn <= 30 ORDER BY ticker, date
+        """)
+        rows = cur.fetchall()
+        cur.close()
+
+    series = defaultdict(list)
+    for ticker, date, close in rows:
+        series[ticker].append({"date": date.isoformat(), "close": float(close)})
+
+    data = {"sparklines": series}
+    _sparklines_cache["data"] = data
+    _sparklines_cache["expires"] = time.time() + 600
+    return data
+
+
+# --- News (cached 15 min server-side) ---
+
+_news_cache = {"expires": 0.0, "data": None}
+
+
+@app.get("/news")
+def get_news():
+    if _news_cache["data"] is not None and _news_cache["expires"] > time.time():
+        return _news_cache["data"]
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT ticker FROM holdings WHERE sold_at IS NULL")
+        tickers = [r[0] for r in cur.fetchall()]
+        cur.close()
+
+    articles = []
+    for t in tickers:
+        for a in get_company_news(t, days=3):
+            articles.append({**a, "ticker": t})
+    # datetime is "YYYY-MM-DD HH:MM" — lexicographic sort works
+    articles.sort(key=lambda a: a["datetime"], reverse=True)
+
+    data = {"articles": articles[:30]}
+    _news_cache["data"] = data
+    _news_cache["expires"] = time.time() + 900
+    return data
+
+
+# --- Live price WebSocket (browser fan-out) ---
+
+@app.websocket("/ws")
+async def ws_prices(websocket: WebSocket):
+    if stream.client_count() >= stream.MAX_CLIENTS:
+        await websocket.close(code=1013)  # try again later
+        return
+    await websocket.accept()
+    stream.add_client(websocket)
+    try:
+        while True:
+            # Clients don't send data; this just detects disconnects.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        stream.remove_client(websocket)

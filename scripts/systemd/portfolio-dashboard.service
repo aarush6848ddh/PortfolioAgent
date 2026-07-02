@@ -1,0 +1,12 @@
+[Unit]
+Description=PortfolioAgent Next.js dashboard
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/aarushs684/portfolioagent/dashboard
+ExecStart=/usr/bin/env npx next start -p 3000 -H 127.0.0.1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -47,6 +47,7 @@ def _call_groq(messages, model="openai/gpt-oss-120b", max_retries=3):
             GROQ_URL,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={"model": model, "messages": messages, "temperature": 0},
+            timeout=30,
         )
         if resp.status_code == 429:
             wait = 10 * (attempt + 1)
@@ -60,6 +61,7 @@ def _call_groq(messages, model="openai/gpt-oss-120b", max_retries=3):
         GROQ_URL,
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
         json={"model": model, "messages": messages, "temperature": 0},
+        timeout=30,
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"].strip()
@@ -81,15 +83,23 @@ def parse_trade(text):
     return None
 
 
-def parse_trade_image(image_url):
-    """Parse a brokerage screenshot into a trade dict, or return None."""
+def parse_trade_image(image_bytes, mime_type="image/jpeg"):
+    """Parse a brokerage screenshot (raw bytes) into a trade dict, or return None.
+
+    Takes raw bytes and sends a base64 data: URL to Groq. Never pass a
+    Telegram file URL here — those embed the bot token and would leak it
+    to a third party.
+    """
+    import base64
+
+    data_url = f"data:{mime_type};base64,{base64.b64encode(bytes(image_bytes)).decode()}"
     messages = [
         {"role": "system", "content": TRADE_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": "Extract the trade details from this brokerage confirmation screenshot."},
-                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "image_url", "image_url": {"url": data_url}},
             ],
         },
     ]

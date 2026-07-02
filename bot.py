@@ -225,6 +225,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle quick-access menu button presses."""
+    if update.effective_chat.id != CHAT_ID:
+        return
     query = update.callback_query
     await query.answer()
 
@@ -282,9 +284,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     photo = update.message.photo[-1]
     file = await photo.get_file()
-    photo_url = file.file_path
+    # Download bytes locally — the Telegram file URL embeds the bot token,
+    # so it must never be sent to a third-party API.
+    image_bytes = await file.download_as_bytearray()
     try:
-        trade = parse_trade_image(photo_url)
+        trade = parse_trade_image(image_bytes)
     except Exception as e:
         log.error(f"Image parse error: {e}", exc_info=True)
         await update.message.reply_text(f"Error reading image: {e}")
@@ -330,6 +334,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != CHAT_ID:
+        return
     query = update.callback_query
     await query.answer()
     trade = context.user_data.pop("pending_trade", None)

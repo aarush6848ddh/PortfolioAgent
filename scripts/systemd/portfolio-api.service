@@ -1,0 +1,13 @@
+[Unit]
+Description=PortfolioAgent FastAPI (REST + WebSocket)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/aarushs684/portfolioagent
+# localhost only — Tailscale Funnel proxies 127.0.0.1:8000 to :8443
+ExecStart=/home/aarushs684/portfolioagent/venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

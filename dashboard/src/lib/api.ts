@@ -1,5 +1,7 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://aarush-box:8000';
 
+export const WS_URL = `${API_BASE.replace(/^http/, 'ws')}/ws`;
+
 async function fetchAPI<T>(endpoint: string): Promise<T> {
   const res = await fetch(`${API_BASE}${endpoint}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`API ${endpoint}: ${res.status}`);
@@ -91,6 +93,27 @@ export interface QuantMetrics {
   };
 }
 
+export interface SparklinePoint {
+  date: string;
+  close: number;
+}
+
+export interface SparklinesResponse {
+  sparklines: Record<string, SparklinePoint[]>;
+}
+
+export interface NewsArticle {
+  ticker: string;
+  headline: string;
+  source: string;
+  summary: string;
+  datetime: string;
+}
+
+export interface NewsResponse {
+  articles: NewsArticle[];
+}
+
 // --- API calls ---
 
 export function getPortfolio() {
@@ -115,4 +138,12 @@ export function getQuant() {
 
 export function getQuantMetrics() {
   return fetchAPI<QuantMetrics>('/portfolio/quant-metrics');
+}
+
+export function getSparklines() {
+  return fetchAPI<SparklinesResponse>('/portfolio/sparklines');
+}
+
+export function getNews() {
+  return fetchAPI<NewsResponse>('/news');
 }

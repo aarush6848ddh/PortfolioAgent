@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TICKERS = ["VTI", "SCHG", "SOXX", "SPY"]
+TICKERS = ["AMZN", "NVDA", "VOO", "AMD", "QQQM", "AVUV", "SPY"]
 
 def get_conn():
     return psycopg2.connect(os.environ["DATABASE_URL"])

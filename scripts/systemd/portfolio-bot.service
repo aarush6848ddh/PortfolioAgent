@@ -1,0 +1,12 @@
+[Unit]
+Description=PortfolioAgent Telegram bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/aarushs684/portfolioagent
+ExecStart=/home/aarushs684/portfolioagent/venv/bin/python -u bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

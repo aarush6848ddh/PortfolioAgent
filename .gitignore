@@ -19,6 +19,9 @@ dashboard/node_modules/
 dashboard/.next/
 dashboard/.env*
 
+# Backups
+*.bak
+
 # OS
 .DS_Store
 
