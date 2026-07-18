@@ -9,7 +9,9 @@ from config import MONTE_CARLO_SIMULATIONS, MONTE_CARLO_DAYS
 load_dotenv()
 
 TRADING_DAYS_PER_YEAR = 252
-RISK_FREE_RATE = 0.053
+# Env-overridable so it can be updated without a code change; keep in sync
+# with the 5% used in api/main.py quant-metrics.
+RISK_FREE_RATE = float(os.environ.get("RISK_FREE_RATE", "0.05"))
 
 def get_conn():
     return psycopg2.connect(os.environ["DATABASE_URL"])
@@ -18,15 +20,16 @@ def get_conn():
 
 def get_daily_closes(ticker, lookback_days=365):
     conn = get_conn()
-    cur = conn.cursor()
-    cutoff = date.today() - timedelta(days=lookback_days)
-    cur.execute(
-        "SELECT date, close_price FROM daily_closes WHERE ticker = %s AND date >= %s ORDER BY date",
-        (ticker, cutoff)
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    try:
+        cur = conn.cursor()
+        cutoff = date.today() - timedelta(days=lookback_days)
+        cur.execute(
+            "SELECT date, close_price FROM daily_closes WHERE ticker = %s AND date >= %s ORDER BY date",
+            (ticker, cutoff)
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
 
 def get_aligned_returns(tickers, lookback_days=365):
     if not tickers:

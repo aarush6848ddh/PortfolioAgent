@@ -45,19 +45,24 @@ import logging
 
 log = logging.getLogger("orchestrator")
 
-def llm_invoke_with_retry(messages, max_retries=3):
-    """Call LLM with retry on rate limit errors."""
-    for attempt in range(max_retries):
+def llm_invoke_with_retry(messages):
+    """Call LLM with backoff on rate limits AND connection errors.
+    Connection errors = WiFi roam gaps (~2min cycle), hence waits up to 30s."""
+    delays = (2, 8, 30)  # 4 total attempts
+    for attempt, delay in enumerate(delays, start=1):
         try:
             return llm.invoke(messages)
         except Exception as e:
-            if "429" in str(e) or "rate_limit" in str(e).lower():
-                wait = 10 * (attempt + 1)
-                log.warning(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait)
-            else:
+            msg = str(e).lower()
+            retryable = "429" in msg or "rate_limit" in msg or "connection" in msg
+            if not retryable:
                 raise
-    return llm.invoke(messages)  # final attempt, let it raise
+            log.warning(
+                f"Groq call failed (attempt {attempt}/{len(delays) + 1}): "
+                f"{type(e).__name__}: {e} — retrying in {delay}s"
+            )
+            time.sleep(delay)
+    return llm.invoke(messages)  # final attempt, let the real traceback raise
 
 
 # --- State ---
@@ -113,7 +118,7 @@ def data_agent(state: AgentState) -> dict:
         total_value += value
         total_cost += cost
         pl = value - cost
-        pl_pct = (price - h["cost_basis"]) / h["cost_basis"] * 100
+        pl_pct = (price - h["cost_basis"]) / h["cost_basis"] * 100 if h["cost_basis"] else 0.0
 
         parts = [
             f"{h['ticker']}: {h['shares']} shares @ ${h['cost_basis']:.2f}",

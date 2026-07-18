@@ -10,6 +10,7 @@ Features:
   - Auto-reconnect, proper error handling
 """
 import os
+import asyncio
 import logging
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -232,14 +233,16 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     action = query.data
     try:
+        # These make sync HTTP quote calls — run in a thread so the
+        # event loop (and thus the whole bot) doesn't block.
         if action == "menu_snapshot":
-            text = get_snapshot_text()
+            text = await asyncio.to_thread(get_snapshot_text)
         elif action == "menu_movers":
-            text = get_movers_text()
+            text = await asyncio.to_thread(get_movers_text)
         elif action == "menu_allocation":
-            text = get_allocation_text()
+            text = await asyncio.to_thread(get_allocation_text)
         elif action == "menu_pl":
-            text = get_pl_text()
+            text = await asyncio.to_thread(get_pl_text)
         else:
             text = "Unknown action."
 
@@ -288,7 +291,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # so it must never be sent to a third-party API.
     image_bytes = await file.download_as_bytearray()
     try:
-        trade = parse_trade_image(image_bytes)
+        trade = await asyncio.to_thread(parse_trade_image, image_bytes)
     except Exception as e:
         log.error(f"Image parse error: {e}", exc_info=True)
         await update.message.reply_text(f"Error reading image: {e}")
@@ -310,7 +313,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info(f"Q: {text}")
 
     try:
-        trade = parse_trade(text)
+        trade = await asyncio.to_thread(parse_trade, text)
     except Exception as e:
         log.error(f"Trade parse error: {e}", exc_info=True)
         trade = None
@@ -322,7 +325,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        answer = run_agents("interactive", question=text)
+        # The full LangGraph pipeline takes minutes — must not block the loop.
+        answer = await asyncio.to_thread(run_agents, "interactive", question=text)
         log_run("interactive", text, answer, True, "user asked a question")
         await send_chunked(answer, context, chat_id=update.effective_chat.id)
         log.info(f"A: {answer[:100]}...")

@@ -61,6 +61,7 @@ def set_alerted_band(ticker, band):
 
 def check_moves():
     lines = []
+    fired = []  # (ticker, band) — recorded only after the send succeeds
     for holding in get_holdings():
         ticker = holding["ticker"]
         quote = get_finnhub_quote(ticker)
@@ -81,11 +82,15 @@ def check_moves():
 
         direction = "up" if change_pct > 0 else "down"
         lines.append(f"{ticker} {direction} {change_pct:+.1f}% today (${quote['current']:.2f})")
-        set_alerted_band(ticker, band)
+        fired.append((ticker, band))
         log.info(f"Alerting {ticker}: {change_pct:+.1f}% (band {prev_band} -> {band})")
 
     if lines:
+        # Mark bands only after the send succeeds — if Telegram fails, the
+        # alert stays eligible and will retry on the next 5-min run.
         send_message("Big move alert\n\n" + "\n".join(lines), disclaimer=False)
+        for ticker, band in fired:
+            set_alerted_band(ticker, band)
 
 
 if __name__ == "__main__":

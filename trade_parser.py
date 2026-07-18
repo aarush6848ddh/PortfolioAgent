@@ -34,37 +34,51 @@ Rules:
 Return ONLY valid JSON. No explanation, no markdown, no code fences."""
 
 
-import time
+import re
 import logging
+
+from retry_utils import retry_call
 
 log = logging.getLogger("trade_parser")
 
 
-def _call_groq(messages, model="openai/gpt-oss-120b", max_retries=3):
-    """Make a raw Groq API call with retry on rate limits."""
-    for attempt in range(max_retries):
-        resp = requests.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": model, "messages": messages, "temperature": 0},
-            timeout=30,
-        )
-        if resp.status_code == 429:
-            wait = 10 * (attempt + 1)
-            log.warning(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/{max_retries})")
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    # Final attempt
+def _groq_once(messages, model):
     resp = requests.post(
         GROQ_URL,
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
         json={"model": model, "messages": messages, "temperature": 0},
         timeout=30,
     )
-    resp.raise_for_status()
+    resp.raise_for_status()  # raises on 429 too, so retry_call backs off
     return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+def _call_groq(messages, model="openai/gpt-oss-120b"):
+    """Groq call with retry on rate limits AND connection errors (4 tries, 2/8/30s)."""
+    return retry_call(_groq_once, messages, model, what=f"Groq {model}")
+
+
+def _validate_trade(result):
+    """Sanity-check LLM output before it ever reaches the DB."""
+    if not (result and isinstance(result, dict)):
+        return None
+    if result.get("action") not in ("buy", "sell"):
+        return None
+    ticker = str(result.get("ticker", "")).upper()
+    if not re.fullmatch(r"[A-Z.]{1,6}", ticker):
+        return None
+    try:
+        shares = float(result.get("shares"))
+        price = result.get("price")
+        price = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        return None
+    if not (0 < shares < 100_000):
+        return None
+    if price is not None and not (0 < price < 1_000_000):
+        return None
+    result["ticker"] = ticker
+    return result
 
 
 def parse_trade(text):
@@ -75,12 +89,9 @@ def parse_trade(text):
     ]
     raw = _call_groq(messages)
     try:
-        result = json.loads(raw)
-        if result and isinstance(result, dict) and result.get("action") and result.get("ticker") and result.get("shares"):
-            return result
+        return _validate_trade(json.loads(raw))
     except json.JSONDecodeError:
-        pass
-    return None
+        return None
 
 
 def parse_trade_image(image_bytes, mime_type="image/jpeg"):
@@ -105,9 +116,6 @@ def parse_trade_image(image_bytes, mime_type="image/jpeg"):
     ]
     raw = _call_groq(messages, model="qwen/qwen3.6-27b")
     try:
-        result = json.loads(raw)
-        if result and isinstance(result, dict) and result.get("action") and result.get("ticker") and result.get("shares"):
-            return result
+        return _validate_trade(json.loads(raw))
     except json.JSONDecodeError:
-        pass
-    return None
+        return None

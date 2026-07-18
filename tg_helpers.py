@@ -8,6 +8,8 @@ import logging
 import requests
 from dotenv import load_dotenv
 
+from retry_utils import retry_call
+
 load_dotenv()
 
 log = logging.getLogger("telegram")
@@ -28,20 +30,25 @@ def send_message(text, disclaimer=False):
     chunks = [text[i:i + MAX_MSG_LEN] for i in range(0, len(text), MAX_MSG_LEN)]
 
     for chunk in chunks:
-        resp = requests.post(
-            url,
+        resp = retry_call(
+            requests.post, url,
             json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"},
             timeout=10,
+            what="Telegram sendMessage",
         )
         if not resp.ok:
             log.warning(f"Markdown send failed ({resp.status_code}), retrying as plain text")
-            resp = requests.post(
-                url,
+            resp = retry_call(
+                requests.post, url,
                 json={"chat_id": chat_id, "text": chunk},
                 timeout=10,
+                what="Telegram sendMessage (plain)",
             )
             if not resp.ok:
-                log.error(f"Send failed: {resp.status_code} {resp.text}")
+                log.error(
+                    f"Telegram send failed: HTTP {resp.status_code} {resp.text} "
+                    f"(chunk len={len(chunk)})"
+                )
 
 
 def send_photo(photo_path, caption=""):

@@ -27,3 +27,6 @@ dashboard/.env*
 
 # Claude
 .claude/
+
+# Generated report charts
+reports/

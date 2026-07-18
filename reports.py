@@ -18,6 +18,21 @@ REPORT_DIR = os.path.expanduser("~/portfolioagent/reports")
 
 def ensure_report_dir():
     os.makedirs(REPORT_DIR, exist_ok=True)
+    _prune_old_charts()
+
+
+def _prune_old_charts(keep_days=60):
+    """Charts are date-named and only sent once — delete anything older
+    than keep_days so the dir doesn't grow forever unattended."""
+    import time
+    cutoff = time.time() - keep_days * 86400
+    try:
+        for name in os.listdir(REPORT_DIR):
+            path = os.path.join(REPORT_DIR, name)
+            if name.endswith(".png") and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+    except OSError as e:
+        log.warning(f"Chart prune failed: {e}")
 
 
 def generate_allocation_pie(holdings):

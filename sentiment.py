@@ -26,7 +26,8 @@ def get_fear_greed():
             context = "Markets are euphoric — historically, extreme greed often precedes pullbacks. Not a prediction, just a pattern."
 
         return {"score": score, "rating": rating, "context": context}
-    except Exception:
+    except Exception as e:
+        log.error(f"Failed to fetch Fear & Greed index: {e}")
         return None
 
 

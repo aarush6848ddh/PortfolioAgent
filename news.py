@@ -19,7 +19,8 @@ def _get(endpoint, params):
         resp = requests.get(f"{BASE}/{endpoint}", params=params, timeout=10)
         return resp.json() if resp.ok else {}
     except Exception as e:
-        log.error(f"Finnhub {endpoint} failed: {e}")
+        # requests exceptions embed the full URL (incl. token=...) — scrub it
+        log.error(f"Finnhub {endpoint} failed: {str(e).replace(API_KEY, '***')}")
         return {}
 
 # --- Company News ---

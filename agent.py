@@ -9,7 +9,8 @@ Modes:
 """
 import sys
 import logging
-from portfolio import is_market_open, log_run
+import traceback
+from portfolio import is_market_open, log_run, record_run_start, record_run_end
 from orchestrator import run_agents
 from tg_helpers import send_message, send_photo
 
@@ -30,16 +31,16 @@ def morning_briefing():
 def intraday_check():
     if not is_market_open():
         print("Market closed, exiting.")
-        return
+        return "skipped"
 
     response = run_agents("intraday")
     is_silent = response.strip() == "SILENT"
 
     if is_silent:
         log_run("intraday", "multi-agent pipeline", response, False, "nothing notable — agent chose SILENT")
-    else:
-        log_run("intraday", "multi-agent pipeline", response, True, "agent flagged something notable")
-        send_message(response, disclaimer=False)
+        return "silent"
+    log_run("intraday", "multi-agent pipeline", response, True, "agent flagged something notable")
+    send_message(response, disclaimer=False)
 
 
 def daily_summary():
@@ -72,8 +73,10 @@ def weekly_digest():
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "intraday"
+    run_id = record_run_start(mode.lstrip("-") if mode.startswith("--") else "intraday")
 
     try:
+        result = None
         if mode == "--morning":
             morning_briefing()
         elif mode == "--summary":
@@ -83,11 +86,14 @@ if __name__ == "__main__":
         elif mode == "--weekly":
             weekly_digest()
         else:
-            intraday_check()
+            result = intraday_check()
+        record_run_end(run_id, result or "success")
     except Exception as e:
-        # Graceful degradation: the failure alert must NOT depend on the LLM
-        # (a Groq rate limit is the most likely cause of failure here).
         log.exception(f"Agent run failed (mode={mode})")
+        # Durable record first — the DB is local and survives network outages,
+        # unlike the Telegram alert below.
+        record_run_end(run_id, "failed", traceback.format_exc()[-4000:])
+        # Graceful degradation: the failure alert must NOT depend on the LLM.
         err = f"{type(e).__name__}: {e}"
         try:
             send_message(f"Agent run failed ({mode}).\n{err[:500]}", disclaimer=False)

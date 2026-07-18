@@ -11,7 +11,18 @@ def get_conn():
 def buy(ticker, shares, cost_basis):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("INSERT INTO holdings (ticker, shares, cost_basis) VALUES (%s, %s, %s)", (ticker, shares, cost_basis))
+    # One open position per ticker, enforced by partial unique index
+    # one_open_position_per_ticker. Buying into an existing position adds
+    # shares and recomputes a weighted-average cost basis.
+    cur.execute(
+        """INSERT INTO holdings (ticker, shares, cost_basis)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (ticker) WHERE sold_at IS NULL DO UPDATE
+           SET shares = holdings.shares + EXCLUDED.shares,
+               cost_basis = (holdings.shares * holdings.cost_basis
+                             + EXCLUDED.shares * EXCLUDED.cost_basis)
+                            / (holdings.shares + EXCLUDED.shares)""",
+        (ticker, shares, cost_basis))
     conn.commit()
     cur.close()
     conn.close()
@@ -20,7 +31,6 @@ def buy(ticker, shares, cost_basis):
     # Track contribution (money deposited)
     try:
         amount = float(shares) * float(cost_basis)
-        cur2 = get_conn().cursor()
         conn2 = get_conn()
         cur2 = conn2.cursor()
         cur2.execute("INSERT INTO contributions (amount, note) VALUES (%s, %s)",
