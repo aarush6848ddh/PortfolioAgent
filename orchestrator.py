@@ -54,6 +54,16 @@ def llm_invoke_with_retry(messages):
             return llm.invoke(messages)
         except Exception as e:
             msg = str(e).lower()
+            # A 413 "request too large" means the prompt itself exceeds the
+            # per-minute token cap. Groq tags it with code 'rate_limit_exceeded',
+            # so it would otherwise match the retryable check below — but retrying
+            # the identical prompt is guaranteed to fail the same way. Fail fast.
+            if "413" in msg or "request too large" in msg:
+                log.error(
+                    f"Groq call failed (non-retryable — prompt exceeds token limit, "
+                    f"not retrying): {type(e).__name__}: {e}"
+                )
+                raise
             retryable = "429" in msg or "rate_limit" in msg or "connection" in msg
             if not retryable:
                 raise
@@ -524,22 +534,47 @@ def synthesis_agent(state: AgentState) -> dict:
     if mode == "interactive" and question:
         question_block = f"\nUser question: {question}\n"
 
+    # Truncate each report before assembling the synthesis prompt. Synthesis is
+    # the only agent that combines all five reports, so with full-length inputs
+    # it can exceed the 8000 TPM cap on volatile days and 413. Same pattern as
+    # bull/bear; bull/bear are already short (4-6 sentences) so their caps are
+    # generous. Total budget stays comfortably under the limit.
+    #
+    # RECENT DECISION MEMORY is appended at the *end* of the data report, so a
+    # plain head-slice would drop it. Split it off first and cap it separately —
+    # it's small and bounded (5 takeaways), so it survives without reintroducing
+    # the original bloat.
+    data_full = state['data_report']
+    memory_block = ""
+    marker = "=== RECENT DECISION MEMORY ==="
+    if marker in data_full:
+        data_full, memory_tail = data_full.split(marker, 1)
+        memory_block = (marker + memory_tail).strip()[:1000]
+
+    data_short = data_full[:1800]
+    news_short = state['news_report'][:1800]
+    quant_short = state['quant_report'][:1200]
+    bull_short = state['bull_report'][:1200]
+    bear_short = state['bear_report'][:1200]
+
+    memory_section = f"\n{memory_block}\n" if memory_block else ""
+
     prompt = f"""{instructions}
 {question_block}
 === DATA REPORT ===
-{state['data_report']}
-
+{data_short}
+{memory_section}
 === NEWS & INTELLIGENCE REPORT ===
-{state['news_report']}
+{news_short}
 
 === QUANT REPORT ===
-{state['quant_report']}
+{quant_short}
 
 === BULL CASE ===
-{state['bull_report']}
+{bull_short}
 
 === BEAR CASE ===
-{state['bear_report']}
+{bear_short}
 
 Rules:
 - Use specific numbers from the reports. Never fabricate.
