@@ -3,6 +3,7 @@ import time
 import logging
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from datetime import date, timedelta
 
 import numpy as np
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
@@ -15,6 +16,8 @@ from slowapi.util import get_remote_address
 from api import quotes, stream
 from api.db import get_db
 from news import get_company_news
+import metrics
+from metrics import MIN_HISTORY_DAYS, LOOKBACK_DAYS
 
 log = logging.getLogger("api")
 
@@ -282,11 +285,25 @@ def get_portfolio_quant():
     }
 
 
+# Portfolio-level aggregates (return, vol, Sharpe, drawdown) are built from a
+# single daily return series summed across holdings, which requires those
+# holdings to share a common date window. A ticker with very little history
+# (e.g. a recent buy) would collapse that window for the whole portfolio, so we
+# exclude anything below this many trading days from portfolio-level math until
+# it has enough data. Excluded tickers are surfaced in `insufficient_history`.
+# MIN_HISTORY_DAYS is imported from metrics (single source of truth).
+
 EMPTY_QUANT_METRICS = {
     "sharpe_ratio": 0, "sortino_ratio": 0, "beta": 0,
     "max_drawdown": 0, "max_drawdown_date": None, "recovery_days": None,
-    "annualized_return": 0, "annualized_volatility": 0,
+    "annualized": False,
+    "annualized_return": None, "annualized_volatility": 0,
+    "period_return": 0, "period_start": None, "period_end": None,
     "correlation_matrix": {"tickers": [], "matrix": []},
+    "insufficient_history": [],
+    "unrealized_pnl": None, "realized_pnl": None, "total_pnl": None,
+    "total_return_pct": None, "total_return_partial": False,
+    "priced_closed_positions": 0, "total_closed_positions": 0,
 }
 
 
@@ -304,23 +321,69 @@ def get_quant_metrics():
 
         all_tickers = list(set(portfolio_tickers + ["SPY"]))
 
+        # Trailing LOOKBACK_DAYS window (shared with quant.py) so the dashboard
+        # and agent paths annualize over the same ~1-year sample.
+        cutoff = date.today() - timedelta(days=LOOKBACK_DAYS)
         cur.execute(
             "SELECT ticker, date, close_price FROM daily_closes "
-            "WHERE ticker = ANY(%s) ORDER BY date",
-            (all_tickers,),
+            "WHERE ticker = ANY(%s) AND date >= %s ORDER BY date",
+            (all_tickers, cutoff),
         )
         rows = cur.fetchall()
 
         holdings = [(r[0], float(r[1]), float(r[2])) for r in get_active_holdings(cur)]
+
+        # Realized/unrealized inputs for the partial total-return figure.
+        cur.execute("SELECT total_value, total_cost FROM daily_snapshots ORDER BY date DESC LIMIT 1")
+        snap = cur.fetchone()
+        cur.execute(
+            "SELECT COALESCE(SUM((sale_price - cost_basis) * shares), 0), "
+            "COALESCE(SUM(cost_basis * shares), 0), COUNT(*) "
+            "FROM holdings WHERE sold_at IS NOT NULL AND sale_price IS NOT NULL"
+        )
+        realized_pnl, priced_closed_cost, priced_closed_positions = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM holdings WHERE sold_at IS NOT NULL")
+        total_closed_positions = cur.fetchone()[0]
         cur.close()
 
-    closes = defaultdict(dict)
-    for ticker, date, close in rows:
-        closes[ticker][date] = float(close)
+    # Partial total return = unrealized P&L on current holdings (from the latest
+    # snapshot) + realized P&L from the closed positions that have a recorded
+    # sale_price. 8 of 14 closed trades have NULL sale_price (missing trade
+    # confirmations, see TODO.md), so this is explicitly partial. The % divides
+    # dollar P&L by summed cost basis and does not net recycled capital (sells
+    # that funded later buys), so it slightly understates the true return.
+    if snap is not None:
+        cur_value, cur_cost = float(snap[0]), float(snap[1])
+        unrealized_pnl = cur_value - cur_cost
+        total_pnl = unrealized_pnl + float(realized_pnl)
+        denom = cur_cost + float(priced_closed_cost)
+        realized_block = {
+            "unrealized_pnl": round(unrealized_pnl, 2),
+            "realized_pnl": round(float(realized_pnl), 2),
+            "total_pnl": round(total_pnl, 2),
+            "total_return_pct": round(total_pnl / denom * 100, 2) if denom else None,
+            "total_return_partial": total_closed_positions > priced_closed_positions,
+            "priced_closed_positions": int(priced_closed_positions),
+            "total_closed_positions": int(total_closed_positions),
+        }
+    else:
+        realized_block = {
+            "unrealized_pnl": None, "realized_pnl": None, "total_pnl": None,
+            "total_return_pct": None, "total_return_partial": False,
+            "priced_closed_positions": int(priced_closed_positions),
+            "total_closed_positions": int(total_closed_positions),
+        }
 
-    port_tickers_with_data = [t for t in portfolio_tickers if len(closes.get(t, {})) >= 2]
+    closes = defaultdict(dict)
+    for ticker, dt, close in rows:
+        closes[ticker][dt] = float(close)
+
+    port_tickers_with_data = [t for t in portfolio_tickers if len(closes.get(t, {})) >= MIN_HISTORY_DAYS]
+    insufficient_history = sorted(
+        t for t in portfolio_tickers if 2 <= len(closes.get(t, {})) < MIN_HISTORY_DAYS
+    )
     if not port_tickers_with_data or len(closes.get("SPY", {})) < 2:
-        return EMPTY_QUANT_METRICS
+        return {**EMPTY_QUANT_METRICS, "insufficient_history": insufficient_history, **realized_block}
 
     # Align all series on dates where every ticker traded, so returns
     # are computed for the same day across tickers (mixed history lengths
@@ -338,46 +401,38 @@ def get_quant_metrics():
 
     spy_ret = returns_by_ticker["SPY"]
 
-    # Portfolio-weighted daily returns (latest prices for weights)
-    total_value = 0
-    ticker_weights = {}
-    for t, shares, _ in holdings:
-        if t in returns_by_ticker:
-            val = shares * closes[t][common_dates[-1]]
-            ticker_weights[t] = val
-            total_value += val
-
-    if total_value == 0:
+    # Dollar-weighted portfolio value series: actual shares held, valued at each
+    # day's close. This is the single canonical construction — the agent path
+    # (quant.py) computes Sharpe/Sortino/drawdown from the exact same series, so
+    # the two paths can no longer disagree. (The old fixed-current-weight,
+    # daily-rebalanced return series lived only here and had drifted from
+    # quant.py and metrics.py.)
+    shares_by_ticker = {t: shares for t, shares, _ in holdings if t in returns_by_ticker}
+    port_values = np.array([
+        sum(shares * closes[t][d] for t, shares in shares_by_ticker.items())
+        for d in common_dates
+    ])
+    if port_values[0] == 0:
         return EMPTY_QUANT_METRICS
 
-    for t in ticker_weights:
-        ticker_weights[t] /= total_value
+    port_returns = metrics.daily_returns(port_values)
 
-    port_returns = np.zeros(len(spy_ret))
-    for t, weight in ticker_weights.items():
-        port_returns += weight * returns_by_ticker[t]
+    # --- Metrics (all from metrics.py, ddof=1 everywhere) ---
+    sharpe = metrics.sharpe_ratio(port_returns)
+    sortino = metrics.sortino_ratio(port_returns)
+    beta = metrics.beta(port_returns, spy_ret)
+    # Coalesce None -> frontend-safe defaults (no dispersion / no downside days).
+    sharpe = 0.0 if sharpe is None else sharpe
+    sortino = 0.0 if sortino is None else sortino
+    beta = 1.0 if beta is None else beta
 
-    # --- Metrics ---
-    rf_daily = 0.05 / 252  # 5% risk-free rate
-
-    excess = port_returns - rf_daily
-    sharpe = float(np.mean(excess) / np.std(excess) * np.sqrt(252)) if np.std(excess) > 0 else 0
-
-    downside = excess[excess < 0]
-    downside_std = np.std(downside) if len(downside) > 0 else 1e-10
-    sortino = float(np.mean(excess) / downside_std * np.sqrt(252))
-
-    cov = np.cov(port_returns, spy_ret)
-    beta = float(cov[0, 1] / cov[1, 1]) if cov[1, 1] > 0 else 1.0
-
-    cum_returns = np.cumprod(1 + port_returns)
-    running_max = np.maximum.accumulate(cum_returns)
-    drawdowns = (cum_returns - running_max) / running_max
-    max_dd = float(np.min(drawdowns) * 100)
-
-    dd_idx = int(np.argmin(drawdowns))
-    # returns[i] corresponds to common_dates[i + 1]
-    max_dd_date = common_dates[min(dd_idx + 1, len(common_dates) - 1)].isoformat()
+    dd = metrics.max_drawdown(port_values)
+    max_dd = dd["max_drawdown_pct"]
+    drawdowns = dd["drawdowns"]
+    dd_idx = dd["trough_index"]
+    # drawdowns is aligned to the value series, so trough_index maps straight to
+    # common_dates (no +1 offset like the old returns-indexed array).
+    max_dd_date = common_dates[dd_idx].isoformat()
 
     recovery_days = None
     if dd_idx < len(drawdowns) - 1:
@@ -385,8 +440,19 @@ def get_quant_metrics():
         if len(recovery) > 0:
             recovery_days = int(recovery[0])
 
-    ann_return = float((cum_returns[-1] ** (252 / len(port_returns)) - 1) * 100)
-    ann_vol = float(np.std(port_returns) * np.sqrt(252) * 100)
+    # Raw cumulative return over the actual window. Annualizing this with
+    # ** (252 / N) is only meaningful with enough observations; on a short
+    # window it extrapolates a few weeks into a fictional yearly rate (e.g. a
+    # 5.18% / 25-day gain became 66%). Below MIN_HISTORY_DAYS we don't
+    # annualize and let the caller show the raw period return instead.
+    n_obs = len(port_returns)
+    growth = port_values[-1] / port_values[0]
+    period_return = float((growth - 1) * 100)
+    period_start = common_dates[0].isoformat()
+    period_end = common_dates[-1].isoformat()
+    annualized = n_obs >= MIN_HISTORY_DAYS
+    ann_return = float((growth ** (252 / n_obs) - 1) * 100) if annualized else None
+    ann_vol = float(np.std(port_returns, ddof=metrics.DDOF) * np.sqrt(252) * 100)
 
     corr_tickers = port_tickers_with_data + ["SPY"]
     corr_returns = [returns_by_ticker[t] for t in corr_tickers]
@@ -399,12 +465,18 @@ def get_quant_metrics():
         "max_drawdown": round(max_dd, 2),
         "max_drawdown_date": max_dd_date,
         "recovery_days": recovery_days,
-        "annualized_return": round(ann_return, 2),
+        "annualized": annualized,
+        "annualized_return": round(ann_return, 2) if ann_return is not None else None,
+        "period_return": round(period_return, 2),
+        "period_start": period_start,
+        "period_end": period_end,
         "annualized_volatility": round(ann_vol, 2),
         "correlation_matrix": {
             "tickers": corr_tickers,
             "matrix": [[round(v, 3) for v in row] for row in corr_matrix],
         },
+        "insufficient_history": insufficient_history,
+        **realized_block,
     }
 
 

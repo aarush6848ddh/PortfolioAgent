@@ -5,20 +5,17 @@ import psycopg2
 from datetime import date, timedelta
 from dotenv import load_dotenv
 from config import MONTE_CARLO_SIMULATIONS, MONTE_CARLO_DAYS
+import metrics
+from metrics import TRADING_DAYS_PER_YEAR, RISK_FREE_RATE, MIN_HISTORY_DAYS, LOOKBACK_DAYS
 
 load_dotenv()
-
-TRADING_DAYS_PER_YEAR = 252
-# Env-overridable so it can be updated without a code change; keep in sync
-# with the 5% used in api/main.py quant-metrics.
-RISK_FREE_RATE = float(os.environ.get("RISK_FREE_RATE", "0.05"))
 
 def get_conn():
     return psycopg2.connect(os.environ["DATABASE_URL"])
 
 # --- Data retrieval ---
 
-def get_daily_closes(ticker, lookback_days=365):
+def get_daily_closes(ticker, lookback_days=LOOKBACK_DAYS):
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -31,7 +28,7 @@ def get_daily_closes(ticker, lookback_days=365):
     finally:
         conn.close()
 
-def get_aligned_returns(tickers, lookback_days=365):
+def get_aligned_returns(tickers, lookback_days=LOOKBACK_DAYS):
     if not tickers:
         return None, None
 
@@ -45,28 +42,31 @@ def get_aligned_returns(tickers, lookback_days=365):
         return None, None
 
     prices = np.array([[all_data[t][d] for t in tickers] for d in common_dates])
-    returns = np.diff(np.log(prices), axis=0)
+    # Simple returns to match metrics.py / api/main.py (single convention everywhere).
+    returns = np.diff(prices, axis=0) / prices[:-1]
     return returns, common_dates[1:]
 
 # --- Beta ---
 
-def calc_beta(ticker, benchmark="SPY", lookback_days=365):
+def calc_beta(ticker, benchmark="SPY", lookback_days=LOOKBACK_DAYS):
     returns, dates = get_aligned_returns([ticker, benchmark], lookback_days)
     if returns is None or len(returns) < 20:
         return None
-    asset_ret = returns[:, 0]
-    bench_ret = returns[:, 1]
-    cov = np.cov(asset_ret, bench_ret)[0, 1]
-    var = np.var(bench_ret, ddof=1)
-    if var == 0:
-        return None
-    return round(float(cov / var), 3)
+    b = metrics.beta(returns[:, 0], returns[:, 1])
+    return None if b is None else round(b, 3)
 
 # --- Correlation ---
 
-def calc_correlation_matrix(tickers, lookback_days=365):
+def calc_correlation_matrix(tickers, lookback_days=LOOKBACK_DAYS):
+    # Exclude short-history tickers (e.g. SPCX at 26 closes) before aligning —
+    # otherwise one recent holding truncates the whole matrix to its tiny
+    # overlap window and every pair becomes a noisy 26-day estimate. Same
+    # MIN_HISTORY_DAYS gate used everywhere else in this module.
+    tickers = [t for t in tickers if len(get_daily_closes(t, lookback_days)) >= MIN_HISTORY_DAYS]
+    if len(tickers) < 2:
+        return None
     returns, dates = get_aligned_returns(tickers, lookback_days)
-    if returns is None or len(returns) < 20:
+    if returns is None or len(returns) < MIN_HISTORY_DAYS:
         return None
     corr = np.corrcoef(returns.T)
     result = {}
@@ -76,18 +76,9 @@ def calc_correlation_matrix(tickers, lookback_days=365):
                 result[f"{t1}/{t2}"] = round(float(corr[i, j]), 3)
     return result
 
-def calc_rolling_correlation(ticker1, ticker2, window=30, lookback_days=365):
-    returns, dates = get_aligned_returns([ticker1, ticker2], lookback_days)
-    if returns is None or len(returns) < window:
-        return None
-    r1 = returns[-window:, 0]
-    r2 = returns[-window:, 1]
-    corr = np.corrcoef(r1, r2)[0, 1]
-    return round(float(corr), 3)
-
 # --- Drawdown ---
 
-def calc_portfolio_drawdown(holdings, lookback_days=365):
+def calc_portfolio_drawdown(holdings, lookback_days=LOOKBACK_DAYS):
     if not holdings:
         return None
 
@@ -99,24 +90,26 @@ def calc_portfolio_drawdown(holdings, lookback_days=365):
         rows = get_daily_closes(t, lookback_days)
         all_data[t] = {r[0]: float(r[1]) for r in rows}
 
-    common_dates = sorted(set.intersection(*[set(d.keys()) for d in all_data.values()]))
-    if len(common_dates) < 2:
+    # Drop short-history tickers (e.g. a recent buy) before intersecting dates —
+    # otherwise one 26-day holding collapses the shared window for the whole
+    # portfolio. Mirrors api/main.py's port_tickers_with_data gate.
+    tickers = [t for t in tickers if len(all_data[t]) >= MIN_HISTORY_DAYS]
+    if not tickers:
         return None
 
-    port_values = []
-    for d in common_dates:
-        val = sum(all_data[t][d] * shares[t] for t in tickers)
-        port_values.append(val)
+    common_dates = sorted(set.intersection(*[set(all_data[t].keys()) for t in tickers]))
+    if len(common_dates) < MIN_HISTORY_DAYS:
+        return None
 
-    port_values = np.array(port_values)
-    cummax = np.maximum.accumulate(port_values)
-    drawdowns = (port_values - cummax) / cummax
+    port_values = np.array([
+        sum(all_data[t][d] * shares[t] for t in tickers) for d in common_dates
+    ])
 
-    max_dd = float(np.min(drawdowns))
-    max_dd_idx = int(np.argmin(drawdowns))
+    dd = metrics.max_drawdown(port_values)
+    max_dd_idx = dd["trough_index"]
     max_dd_date = common_dates[max_dd_idx]
 
-    peak_before = cummax[max_dd_idx]
+    peak_before = np.maximum.accumulate(port_values)[max_dd_idx]
     recovery_days = None
     for i in range(max_dd_idx + 1, len(port_values)):
         if port_values[i] >= peak_before:
@@ -124,14 +117,14 @@ def calc_portfolio_drawdown(holdings, lookback_days=365):
             break
 
     return {
-        "max_drawdown_pct": round(max_dd * 100, 2),
+        "max_drawdown_pct": round(dd["max_drawdown_pct"], 2),
         "trough_date": str(max_dd_date),
         "recovery_days": recovery_days,
     }
 
 # --- Risk-adjusted returns ---
 
-def calc_sharpe_sortino(holdings, lookback_days=365):
+def calc_sharpe_sortino(holdings, lookback_days=LOOKBACK_DAYS):
     if not holdings:
         return None
 
@@ -143,32 +136,32 @@ def calc_sharpe_sortino(holdings, lookback_days=365):
         rows = get_daily_closes(t, lookback_days)
         all_data[t] = {r[0]: float(r[1]) for r in rows}
 
-    common_dates = sorted(set.intersection(*[set(d.keys()) for d in all_data.values()]))
-    if len(common_dates) < 20:
+    # Drop short-history tickers before intersecting dates (see
+    # calc_portfolio_drawdown). Mirrors api/main.py's port_tickers_with_data gate.
+    tickers = [t for t in tickers if len(all_data[t]) >= MIN_HISTORY_DAYS]
+    if not tickers:
+        return None
+
+    common_dates = sorted(set.intersection(*[set(all_data[t].keys()) for t in tickers]))
+    if len(common_dates) < MIN_HISTORY_DAYS:
         return None
 
     port_values = np.array([
         sum(all_data[t][d] * shares[t] for t in tickers) for d in common_dates
     ])
-    daily_returns = np.diff(port_values) / port_values[:-1]
+    port_returns = metrics.daily_returns(port_values)
 
-    daily_rf = RISK_FREE_RATE / TRADING_DAYS_PER_YEAR
-    excess = daily_returns - daily_rf
+    sharpe = metrics.sharpe_ratio(port_returns)
+    sortino = metrics.sortino_ratio(port_returns)
 
-    sharpe = None
-    if np.std(excess, ddof=1) > 0:
-        sharpe = round(float(np.mean(excess) / np.std(excess, ddof=1) * np.sqrt(TRADING_DAYS_PER_YEAR)), 3)
-
-    downside = excess[excess < 0]
-    sortino = None
-    if len(downside) > 0 and np.std(downside, ddof=1) > 0:
-        sortino = round(float(np.mean(excess) / np.std(downside, ddof=1) * np.sqrt(TRADING_DAYS_PER_YEAR)), 3)
-
-    return {"sharpe": sharpe, "sortino": sortino}
+    return {
+        "sharpe": None if sharpe is None else round(sharpe, 3),
+        "sortino": None if sortino is None else round(sortino, 3),
+    }
 
 # --- Backtest vs VTI baseline ---
 
-def backtest_vs_vti(holdings, lookback_days=365):
+def backtest_vs_vti(holdings, lookback_days=LOOKBACK_DAYS):
     if not holdings:
         return None
 
@@ -220,24 +213,37 @@ def monte_carlo_simulation(holdings):
         rows = get_daily_closes(t)
         all_data[t] = {r[0]: float(r[1]) for r in rows}
 
-    common_dates = sorted(set.intersection(*[set(d.keys()) for d in all_data.values()]))
-    if len(common_dates) < 60:
+    # Drop short-history tickers before intersecting dates (see
+    # calc_sharpe_sortino). Otherwise one recent holding (e.g. SPCX at 26 days)
+    # collapses the window below the gate and the whole simulation returns None.
+    tickers = [t for t in tickers if len(all_data[t]) >= MIN_HISTORY_DAYS]
+    if not tickers:
+        return None
+
+    common_dates = sorted(set.intersection(*[set(all_data[t].keys()) for t in tickers]))
+    if len(common_dates) < MIN_HISTORY_DAYS:
         return None
 
     port_values = np.array([
         sum(all_data[t][d] * shares[t] for t in tickers) for d in common_dates
     ])
-    daily_returns = np.diff(port_values) / port_values[:-1]
 
+    # Geometric (GBM-consistent) drift: model LOG returns as Normal and build
+    # price paths as exp(cumsum(...)). Using the arithmetic mean of simple
+    # returns as drift in a cumprod(1 + r) model overstates the median terminal
+    # value under compounding (Jensen's inequality).
+    log_r = metrics.log_returns(port_values)
     current_value = port_values[-1]
-    mu = np.mean(daily_returns)
-    sigma = np.std(daily_returns)
+    mu = np.mean(log_r)
+    sigma = np.std(log_r, ddof=metrics.DDOF)
 
+    # Fixed seed keeps the displayed forecast band stable across dashboard
+    # refreshes; it's still 1000 real random paths, just a reproducible draw.
     np.random.seed(42)
     simulations = np.zeros((MONTE_CARLO_SIMULATIONS, MONTE_CARLO_DAYS))
     for i in range(MONTE_CARLO_SIMULATIONS):
-        daily_r = np.random.normal(mu, sigma, MONTE_CARLO_DAYS)
-        price_path = current_value * np.cumprod(1 + daily_r)
+        log_path = np.random.normal(mu, sigma, MONTE_CARLO_DAYS)
+        price_path = current_value * np.exp(np.cumsum(log_path))
         simulations[i] = price_path
 
     final_values = simulations[:, -1]
@@ -265,7 +271,6 @@ def get_quant_summary(holdings):
     if not tickers:
         return {
             "betas": {}, "correlations": None,
-            "rolling_corr_soxx_schg": None, "rolling_corr_soxx_vti": None,
             "drawdown": None, "risk_adjusted": None,
             "backtest": None, "monte_carlo": None,
         }
@@ -273,8 +278,6 @@ def get_quant_summary(holdings):
     summary = {
         "betas": {},
         "correlations": None,
-        "rolling_corr_soxx_schg": None,
-        "rolling_corr_soxx_vti": None,
         "drawdown": None,
         "risk_adjusted": None,
         "backtest": None,
@@ -285,8 +288,6 @@ def get_quant_summary(holdings):
         summary["betas"][t] = calc_beta(t)
 
     summary["correlations"] = calc_correlation_matrix(tickers)
-    summary["rolling_corr_soxx_schg"] = calc_rolling_correlation("SOXX", "SCHG")
-    summary["rolling_corr_soxx_vti"] = calc_rolling_correlation("SOXX", "VTI")
     summary["drawdown"] = calc_portfolio_drawdown(holdings)
     summary["risk_adjusted"] = calc_sharpe_sortino(holdings)
     summary["backtest"] = backtest_vs_vti(holdings)
@@ -306,11 +307,6 @@ def format_quant_for_prompt(summary):
     if summary["correlations"]:
         corr_parts = [f"{pair}: {val}" for pair, val in summary["correlations"].items()]
         lines.append(f"Correlation matrix: {', '.join(corr_parts)}")
-
-    if summary["rolling_corr_soxx_schg"] is not None:
-        lines.append(f"SOXX/SCHG 30-day rolling correlation: {summary['rolling_corr_soxx_schg']}")
-    if summary["rolling_corr_soxx_vti"] is not None:
-        lines.append(f"SOXX/VTI 30-day rolling correlation: {summary['rolling_corr_soxx_vti']}")
 
     dd = summary["drawdown"]
     if dd:

@@ -4,6 +4,17 @@ import type { QuantMetrics } from '@/lib/api';
 export function QuantStrip({ metrics }: { metrics: QuantMetrics | null }) {
   if (!metrics || !metrics.correlation_matrix?.tickers?.length) return null;
 
+  // When the window is too short to annualize, the API returns
+  // annualized:false with annualized_return === null. Fall back to the raw
+  // period return + date range so we never call formatPercent on a null.
+  const showAnnualized = metrics.annualized && metrics.annualized_return != null;
+  const returnValue = showAnnualized ? metrics.annualized_return! : metrics.period_return;
+  const returnSub = showAnnualized
+    ? '252D'
+    : metrics.period_start && metrics.period_end
+      ? `${metrics.period_start} - ${metrics.period_end}`
+      : 'PERIOD';
+
   const cells = [
     {
       label: 'Sharpe',
@@ -30,10 +41,10 @@ export function QuantStrip({ metrics }: { metrics: QuantMetrics | null }) {
       subColor: 'text-negative',
     },
     {
-      label: 'Ann. Return',
-      value: formatPercent(metrics.annualized_return),
-      sub: '252D',
-      subColor: metrics.annualized_return >= 0 ? 'text-positive' : 'text-negative',
+      label: showAnnualized ? 'Ann. Return' : 'Period Return',
+      value: formatPercent(returnValue),
+      sub: returnSub,
+      subColor: returnValue >= 0 ? 'text-positive' : 'text-negative',
     },
     {
       label: 'Ann. Vol',

@@ -47,7 +47,11 @@ export interface QuantMetrics {
   max_drawdown: number;
   max_drawdown_date: string;
   recovery_days: number | null;
-  annualized_return: number;
+  annualized: boolean;
+  annualized_return: number | null;
+  period_return: number;
+  period_start: string | null;
+  period_end: string | null;
   annualized_volatility: number;
   correlation_matrix: {
     tickers: string[];
@@ -244,7 +248,11 @@ export const mockQuantMetrics: QuantMetrics = {
   max_drawdown: -8.73,
   max_drawdown_date: '2026-04-12',
   recovery_days: 14,
+  annualized: true,
   annualized_return: 14.2,
+  period_return: 16.8,
+  period_start: '2025-04-12',
+  period_end: '2026-04-12',
   annualized_volatility: 11.5,
   correlation_matrix: {
     tickers: ['SOXX', 'VTI', 'SPY'],

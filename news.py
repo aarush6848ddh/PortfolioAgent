@@ -1,8 +1,11 @@
 """Market intelligence module — news, insider data, earnings, fundamentals,
 ETF holdings, technicals, sentiment, congressional trading from Finnhub."""
 import os
+import socket
 import logging
 import requests
+import yfinance as yf
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -12,6 +15,28 @@ log = logging.getLogger("news")
 
 API_KEY = os.environ["FINNHUB_API_KEY"]
 BASE = "https://finnhub.io/api/v1"
+
+
+@contextmanager
+def _force_ipv4():
+    """Pin DNS resolution to IPv4 for the duration of the block.
+
+    This host resolves Yahoo/Finnhub to IPv6 but has no working IPv6 route, so
+    yfinance's default lookups dead-end and return an empty (looks-delisted)
+    result. Scoped rather than global so we don't alter socket behavior for the
+    whole process. Not thread-safe — only used from the (single-threaded) report
+    / backfill paths.
+    """
+    orig = socket.getaddrinfo
+
+    def ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        return orig(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = ipv4_only
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = orig
 
 def _get(endpoint, params):
     params["token"] = API_KEY
@@ -388,21 +413,49 @@ def get_esg_score(ticker):
 # --- Dividends ---
 
 def get_dividends(ticker, days=365):
-    """Get dividend history."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    data = _get("stock/dividend", {"symbol": ticker, "from": from_date, "to": today})
-    if not isinstance(data, list):
-        return []
-    return [
-        {
-            "ex_date": d.get("date", ""),
-            "pay_date": d.get("payDate", ""),
-            "amount": d.get("amount", 0),
-            "currency": d.get("currency", "USD"),
-        }
-        for d in data[:10]
-    ]
+    """Per-share dividend history for a ticker, newest first.
+
+    Source: yfinance (Yahoo). Finnhub's stock/dividend is a premium endpoint
+    that 403s on the free plan, so the old implementation silently returned []
+    for everything — indistinguishable from "this ticker pays no dividend" and
+    the reason the dividends table stayed empty. Yahoo does not expose a pay
+    date, so pay_date is None here.
+
+    Raises RuntimeError on a fetch failure (network/API problem) so it can't
+    quietly zero out a backfill; a genuinely dividend-free ticker returns [].
+    """
+    cutoff = (datetime.now() - timedelta(days=days)).date()
+    try:
+        with _force_ipv4():
+            tk = yf.Ticker(ticker)
+            divs = tk.dividends
+            if divs is None or divs.empty:
+                # yfinance returns an empty series both for a real no-dividend
+                # ticker AND for a failed fetch. Disambiguate: if we can't even
+                # pull recent prices, the fetch failed — surface it loudly.
+                hist = tk.history(period="5d")
+                if hist is None or hist.empty:
+                    raise RuntimeError(f"no data returned for {ticker} (fetch likely failed)")
+                return []
+    except RuntimeError:
+        raise
+    except Exception as e:
+        log.error(f"yfinance dividends fetch failed for {ticker}: {e}")
+        raise RuntimeError(f"dividend fetch failed for {ticker}") from e
+
+    result = []
+    for ex_ts, amount in divs.items():
+        ex_date = ex_ts.date()
+        if ex_date < cutoff:
+            continue
+        result.append({
+            "ex_date": ex_date.isoformat(),
+            "pay_date": None,  # Yahoo does not provide a pay date
+            "amount": round(float(amount), 4),
+            "currency": "USD",
+        })
+    result.sort(key=lambda d: d["ex_date"], reverse=True)
+    return result
 
 # --- Market Status ---
 
@@ -647,10 +700,15 @@ def get_full_intel(holdings):
     # 17. Dividends
     div_data = []
     for t in tickers:
-        divs = get_dividends(t, days=180)
+        try:
+            divs = get_dividends(t, days=180)
+        except RuntimeError as e:
+            log.warning(f"skipping dividends for {t}: {e}")
+            continue
         if divs:
             recent = divs[0]
-            div_data.append(f"{t}: last dividend ${recent['amount']} (ex-date: {recent['ex_date']}, pay: {recent['pay_date']})")
+            pay = recent["pay_date"] or "n/a"
+            div_data.append(f"{t}: last dividend ${recent['amount']} (ex-date: {recent['ex_date']}, pay: {pay})")
     if div_data:
         sections.append("\n=== RECENT DIVIDENDS ===")
         sections.extend(div_data)

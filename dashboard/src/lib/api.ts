@@ -85,7 +85,11 @@ export interface QuantMetrics {
   max_drawdown: number;
   max_drawdown_date: string | null;
   recovery_days: number | null;
-  annualized_return: number;
+  annualized: boolean;
+  annualized_return: number | null;
+  period_return: number;
+  period_start: string | null;
+  period_end: string | null;
   annualized_volatility: number;
   correlation_matrix: {
     tickers: string[];
