@@ -1,8 +1,8 @@
 # PortfolioAgent
 
-> A self-hosted, multi-agent AI system that watches my real investment portfolio, debates its own outlook, and briefs me over Telegram, with a live web dashboard on the side.
+> A self-hosted, multi-agent AI system that monitors a live investment portfolio, evaluates both bullish and bearish outlooks, and delivers briefings over Telegram, backed by a real-time web dashboard.
 
-PortfolioAgent is a personal quantitative research analyst that never sleeps. Six specialist LLM agents run on a schedule (and on demand), pulling live market data, news, insider activity, and quant metrics, then argue a bull vs. bear case before synthesizing a plain-English briefing. I log trades by simply texting the bot, or by sending it a screenshot of a broker confirmation, which a vision model reads automatically.
+PortfolioAgent is a personal quantitative research assistant. Six specialist LLM agents run on a schedule and on demand, gathering live market data, news, insider activity, and quantitative metrics, then argue a bull and bear case before synthesizing a concise, plain-English briefing. Trades are logged by texting the bot directly, or by sending a screenshot of a broker confirmation, which a vision model parses automatically.
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.14-3776AB?logo=python&logoColor=white">
@@ -17,7 +17,7 @@ PortfolioAgent is a personal quantitative research analyst that never sleeps. Si
 
 ## Table of contents
 
-- [Why I built it](#why-i-built-it)
+- [Overview](#overview)
 - [Highlights](#highlights)
 - [Architecture](#architecture)
 - [The multi-agent pipeline](#the-multi-agent-pipeline)
@@ -31,33 +31,33 @@ PortfolioAgent is a personal quantitative research analyst that never sleeps. Si
 - [Data model](#data-model)
 - [Getting started](#getting-started)
 - [Deployment](#deployment)
-- [Design notes & engineering lessons](#design-notes--engineering-lessons)
+- [Engineering notes](#engineering-notes)
 - [Disclaimer](#disclaimer)
 
 ---
 
-## Why I built it
+## Overview
 
-I wanted to actually understand what my money was doing instead of glancing at a broker app once a day. Off-the-shelf tools either dumbed everything down or drowned me in numbers with no interpretation. So I built an analyst that:
+PortfolioAgent was built to provide interpreted, decision-ready analysis of a personal portfolio rather than raw numbers or oversimplified summaries. It was designed around several goals:
 
-- Speaks to me like a smart friend explaining finance, not a Bloomberg terminal.
-- Forms a real opinion by making it argue *against itself* (bull vs. bear) before concluding.
-- Combines **live data, news, and hard quant math**, not just one of them.
-- Lives entirely on my own hardware, with secrets that never leave the box.
+- Produce clear, accessible explanations of portfolio performance and market conditions.
+- Form a balanced view by explicitly generating and weighing opposing bull and bear cases.
+- Combine live market data, news intelligence, and quantitative analysis in a single pipeline.
+- Run entirely on self-hosted hardware, with all credentials kept server-side.
 
-It's also my playground for production agentic-AI patterns: parallel graph execution, retry/backoff around flaky networks, rate-limit-aware prompt budgeting, and decision memory so the agents don't contradict themselves week to week.
+It also serves as a practical implementation of production agentic-AI patterns: parallel graph execution, retry and backoff around unreliable networks, rate-limit-aware prompt budgeting, and decision memory that keeps agent conclusions consistent over time.
 
 ---
 
 ## Highlights
 
-- **6-agent LangGraph pipeline** with true parallel fan-out and a bull/bear debate stage.
-- **Multimodal trade logging.** Log a trade by typing it, or by sending a broker screenshot parsed by a vision LLM.
-- **Live streaming dashboard.** One Finnhub WebSocket is fanned out to browsers; the API key never touches the client.
-- **Real quant, not vibes.** Beta, correlation matrix, Sharpe/Sortino, max drawdown, Monte Carlo, and a backtest vs. VTI.
-- **Decision memory.** The agent remembers its recent calls and stays consistent.
-- **Self-healing cron.** Detects a missed scheduled digest and re-runs it.
-- **Hardened by default.** Rate limiting, locked CORS, GET-only API, IPv4 pinning around a flaky network, and retry/backoff everywhere.
+- **6-agent LangGraph pipeline** with parallel fan-out and a dedicated bull/bear debate stage.
+- **Multimodal trade logging.** Trades can be entered as text or as a broker screenshot parsed by a vision LLM.
+- **Live streaming dashboard.** A single Finnhub WebSocket connection is fanned out to browsers; the API key never reaches the client.
+- **Quantitative rigor.** Beta, correlation matrix, Sharpe and Sortino ratios, maximum drawdown, Monte Carlo simulation, and a benchmark backtest against VTI.
+- **Decision memory.** The system retains recent conclusions to maintain consistency across runs.
+- **Self-healing scheduler.** Missed or hung scheduled digests are detected and re-run automatically.
+- **Security by default.** Rate limiting, restricted CORS, a read-only API, IPv4 pinning for unreliable routes, and retry/backoff throughout.
 
 ---
 
@@ -69,7 +69,7 @@ flowchart TB
         FH["Finnhub<br/>news, insiders, earnings<br/>recommendations, social"]
         YF["yfinance<br/>price history"]
         FG["CNN Fear & Greed"]
-        TG_IN["Telegram<br/>(me: trades & questions)"]
+        TG_IN["Telegram<br/>(trades & questions)"]
     end
 
     subgraph Core["PortfolioAgent Core (Python)"]
@@ -110,13 +110,13 @@ flowchart TB
     class API,WS,DASH serve
 ```
 
-Everything runs on a single self-hosted Ubuntu mini PC as three `systemd` services (API, bot, dashboard), exposed to the internet over Tailscale Funnel with automatic HTTPS.
+The system runs on a single self-hosted Ubuntu machine as three `systemd` services (API, bot, dashboard), exposed over Tailscale Funnel with automatic HTTPS.
 
 ---
 
 ## The multi-agent pipeline
 
-The heart of the system is a [LangGraph](https://langchain-ai.github.io/langgraph/) state graph. Three research agents run **in parallel**, feed a **bull/bear debate**, and a synthesis agent writes the final briefing.
+The core of the system is a [LangGraph](https://langchain-ai.github.io/langgraph/) state graph. Three research agents run **in parallel**, feed a **bull/bear debate**, and a synthesis agent produces the final briefing.
 
 ```mermaid
 flowchart LR
@@ -145,14 +145,14 @@ flowchart LR
 
 | Agent | Role |
 |-------|------|
-| **data_agent** | Portfolio snapshot: live prices, P&L, win/loss streaks, allocation, performance attribution, threshold alerts, and drift-from-target detection. |
-| **news_agent** | Pulls full market intelligence (news, insider activity, earnings, analyst actions, social sentiment) and has the LLM synthesize what actually matters. |
-| **quant_agent** | Runs the quant engine (beta, correlations, drawdown, Sharpe/Sortino, Monte Carlo) and translates the numbers into intuition. |
-| **bull_agent** | Builds the strongest *data-cited* optimistic case over the next one to three months. |
-| **bear_agent** | Builds the strongest *data-cited* pessimistic case: concentration risk, downgrades, macro headwinds. |
-| **synthesis_agent** | Weighs both sides against recent decision memory and writes the final, mode-specific briefing. |
+| **data_agent** | Builds the portfolio snapshot: live prices, P&L, win/loss streaks, allocation, performance attribution, threshold alerts, and drift-from-target detection. |
+| **news_agent** | Gathers full market intelligence (news, insider activity, earnings, analyst actions, social sentiment) and uses the LLM to synthesize the material points. |
+| **quant_agent** | Runs the quantitative engine (beta, correlations, drawdown, Sharpe/Sortino, Monte Carlo) and interprets the results. |
+| **bull_agent** | Constructs the strongest data-supported optimistic case over the next one to three months. |
+| **bear_agent** | Constructs the strongest data-supported pessimistic case: concentration risk, downgrades, and macro headwinds. |
+| **synthesis_agent** | Weighs both cases against recent decision memory and produces the final, mode-specific briefing. |
 
-The graph adapts its output to the current **mode** (morning / intraday / daily / friday / weekly / interactive), from a terse intraday nudge to a full weekend report with charts. Intraday runs can even choose to stay `SILENT` when nothing is worth pinging me about.
+The graph adapts its output to the current **mode** (morning, intraday, daily, friday, weekly, interactive), ranging from a brief intraday note to a full weekend report with charts. Intraday runs can return `SILENT` when no notable event warrants a notification.
 
 ---
 
@@ -160,7 +160,7 @@ The graph adapts its output to the current **mode** (morning / intraday / daily 
 
 | Source | What it provides |
 |--------|------------------|
-| **Finnhub** | Company news, insider sentiment & transactions, analyst recommendations, upcoming earnings & surprises, upgrades/downgrades, price targets, congressional trading, Reddit/social sentiment, ETF holdings & sector exposure, economic calendar. |
+| **Finnhub** | Company news, insider sentiment and transactions, analyst recommendations, upcoming earnings and surprises, upgrades and downgrades, price targets, congressional trading, Reddit and social sentiment, ETF holdings and sector exposure, economic calendar. |
 | **Finnhub WebSocket** | Real-time trade ticks for live prices. |
 | **yfinance** | Historical daily closes for the quant engine and dividend history. |
 | **CNN Fear & Greed Index** | Market sentiment, with sustained-fear detection. |
@@ -169,54 +169,54 @@ The graph adapts its output to the current **mode** (morning / intraday / daily 
 
 ## Quant toolkit
 
-`quant.py` computes real portfolio math over aligned return series:
+`quant.py` computes portfolio statistics over aligned return series:
 
-- **Beta** of each holding vs. the S&P 500.
+- **Beta** of each holding relative to the S&P 500.
 - **Correlation matrix** across holdings.
-- **Max drawdown** with trough and recovery dates.
-- **Sharpe & Sortino** ratios (configurable risk-free rate).
+- **Maximum drawdown** with trough and recovery dates.
+- **Sharpe and Sortino** ratios (configurable risk-free rate).
 - **Monte Carlo simulation** of forward portfolio value (default 1,000 runs over 252 trading days).
-- **Backtest vs. VTI** as a total-market benchmark.
+- **Benchmark backtest** against VTI as a total-market reference.
 
-The REST API also exposes a richer `/portfolio/quant-metrics` endpoint that honestly flags partial data (e.g. closed positions missing a recorded sale price) rather than silently reporting a wrong number.
+The REST API also exposes `/portfolio/quant-metrics`, which explicitly flags partial data (for example, closed positions missing a recorded sale price) rather than reporting an incomplete figure as if it were complete.
 
 ---
 
 ## The Telegram bot
 
-The bot is my entire interface to the system:
+The bot is the primary interface to the system:
 
-- **Ask anything.** Free-text questions kick off the full agent pipeline in interactive mode and stream back a chunked answer.
-- **Log a trade by typing it.** "bought 2 NVDA at 178" is parsed by an LLM into a structured trade and shown for confirmation.
-- **Log a trade from a screenshot.** Send a broker confirmation image and a **vision model (`qwen3-vl`)** extracts the trade. (The Telegram file URL embeds the bot token, so the image is downloaded to bytes first and never handed to a third party.)
-- **Inline confirmation buttons.** Every trade is confirmed before it hits the database.
-- **`/menu`** for quick actions, and **`/target`** to set target allocations that power drift alerts.
+- **Interactive questions.** Free-text questions trigger the full agent pipeline in interactive mode and return a chunked response.
+- **Text trade logging.** Input such as "bought 2 NVDA at 178" is parsed by an LLM into a structured trade and shown for confirmation.
+- **Screenshot trade logging.** A broker confirmation image is parsed by a vision model (`qwen3-vl`). The Telegram file URL embeds the bot token, so the image is downloaded to bytes first and never sent to a third party.
+- **Inline confirmation.** Every trade is confirmed before it is written to the database.
+- **Commands.** `/menu` provides quick actions, and `/target` sets target allocations that drive drift alerts.
 
 ---
 
 ## Scheduled intelligence
 
-Cron drives `agent.py` in different modes (ET):
+Cron runs `agent.py` in different modes (ET):
 
 | When | Mode | Output |
 |------|------|--------|
 | 8:55 AM (weekdays) | `--morning` | Pre-market briefing (with disclaimer). |
-| Every 30 min, market hours | *(default)* intraday | Notable-move check; stays silent if nothing matters. |
+| Every 30 min, market hours | *(default)* intraday | Notable-move check; silent if nothing is material. |
 | 4:05 PM (weekdays) | `--summary` | End-of-day summary. |
 | 4:35 PM (Friday) | `--friday` | Weekly P&L digest. |
 | 9:00 AM (Saturday) | `--weekly` | Full weekend report with charts. |
-| Every 5 min, market hours | `alerts.py` | LLM-free big-move alerts (per-ticker bands, deduped). |
+| Every 5 min, market hours | `alerts.py` | LLM-free big-move alerts (per-ticker bands, deduplicated). |
 | After each digest | `self_heal.py` | Re-runs any scheduled digest that failed or hung. |
 
-Every run is recorded in `agent_runs` so `self_heal.py` can detect stuck/failed jobs, and any top-level failure sends a plain fallback Telegram alert.
+Every run is recorded in `agent_runs`, allowing `self_heal.py` to detect stuck or failed jobs. Any top-level failure sends a plain fallback Telegram alert.
 
 ---
 
 ## Web dashboard & live prices
 
-A **Next.js 16 / React 19** dashboard (Tailwind 4, Recharts, Framer Motion) visualizes holdings, history, quant metrics, sparklines, fear & greed, and news.
+A **Next.js 16 / React 19** dashboard (Tailwind 4, Recharts, Framer Motion) visualizes holdings, history, quant metrics, sparklines, the Fear & Greed index, and news.
 
-Live prices use a clean fan-out pattern: **one** asyncio task holds the single allowed Finnhub WebSocket connection, subscribes to all active holdings plus SPY, and broadcasts every tick to browsers connected to the FastAPI `/ws` endpoint. The Finnhub key stays server-side; the browser never sees it. The subscription list refreshes every 5 minutes so newly bought tickers stream automatically.
+Live prices use a fan-out pattern: a single asyncio task holds the one permitted Finnhub WebSocket connection, subscribes to all active holdings plus SPY, and broadcasts every tick to browsers connected to the FastAPI `/ws` endpoint. The Finnhub key remains server-side and is never exposed to the browser. The subscription list refreshes every 5 minutes so newly purchased tickers begin streaming automatically.
 
 **Key API endpoints:** `/portfolio`, `/portfolio/history`, `/portfolio/analysis`, `/portfolio/quant`, `/portfolio/quant-metrics`, `/portfolio/sparklines`, `/fear-greed`, `/news`, `/ws`, `/health`.
 
@@ -271,14 +271,14 @@ PostgreSQL 18 (with pgvector). Core tables:
 
 | Table | Purpose |
 |-------|---------|
-| `holdings` | Positions (ticker, shares, cost basis, buy/sell dates & prices). Active = `sold_at IS NULL`; a partial unique index enforces one open position per ticker. |
+| `holdings` | Positions (ticker, shares, cost basis, buy/sell dates and prices). Active positions have `sold_at IS NULL`; a partial unique index enforces one open position per ticker. |
 | `daily_closes` | One OHLCV row per ticker per day for the quant engine. |
-| `daily_snapshots` | Portfolio value snapshots for history/charts. |
-| `agent_logs` | Every reasoning run: prompt, response, whether it was sent, and why. |
+| `daily_snapshots` | Portfolio value snapshots for history and charts. |
+| `agent_logs` | Every reasoning run: prompt, response, whether it was sent, and the reason. |
 | `agent_runs` | Run status (running/success/silent/skipped/failed) for self-healing. |
-| `alert_state` | Dedup state for big-move alerts. |
+| `alert_state` | Deduplication state for big-move alerts. |
 | `fear_greed_history` | Daily Fear & Greed readings. |
-| `decision_memory` | The agent's recent decisions, for cross-run consistency. |
+| `decision_memory` | Recent agent decisions, for cross-run consistency. |
 | `target_allocation` | User targets that drive drift alerts. |
 | `contributions` | Buy-transaction log. |
 | `dividends` | Per-share dividend events from yfinance. |
@@ -287,7 +287,7 @@ PostgreSQL 18 (with pgvector). Core tables:
 
 ## Getting started
 
-> This is a personal, single-user project (my Telegram chat ID is the only authorized user). It's shared as a reference and portfolio piece rather than a turnkey product, but here's the shape of a local setup.
+> This is a single-user project (one authorized Telegram chat ID). It is provided as a reference and portfolio piece rather than a turnkey product, but the following outlines a local setup.
 
 **Prerequisites:** Python 3.14, PostgreSQL 18 (+ pgvector), Node.js 20+, and a Telegram bot token.
 
@@ -310,7 +310,7 @@ psql portfolioagent -f db/migrations_v3.sql
 # 4. Configure secrets (see below)
 cp .env.example .env   # then fill it in
 
-# 5. Run the pieces
+# 5. Run the services
 python bot.py                                   # Telegram bot
 uvicorn api.main:app --host 127.0.0.1 --port 8000   # REST + /ws
 python agent.py --morning                       # one-off briefing
@@ -324,10 +324,10 @@ cd dashboard && npm install && npm run dev      # dashboard
 | Var | Purpose |
 |-----|---------|
 | `GROQ_API_KEY` | Groq LLM access. |
-| `FINNHUB_API_KEY` | Market data + WebSocket. |
+| `FINNHUB_API_KEY` | Market data and WebSocket. |
 | `DATABASE_URL` | PostgreSQL connection string. |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot. |
-| `TELEGRAM_CHAT_ID` | The one authorized chat. |
+| `TELEGRAM_CHAT_ID` | The authorized chat. |
 
 **Optional tuning** (defaults shown)
 
@@ -343,38 +343,38 @@ cd dashboard && npm install && npm run dev      # dashboard
 | `MORNING_WORD_LIMIT` / `INTRADAY_WORD_LIMIT` | `150` / `80` | Briefing length caps. |
 | `HEALTH_CHECK_PORT` | `8111` | Bot health check port. |
 
-Secrets always live in `.env` and are never hardcoded.
+Secrets are kept in `.env` and are never hardcoded.
 
 ---
 
 ## Deployment
 
-Running as three `systemd` services on a self-hosted Ubuntu box:
+The system runs as three `systemd` services on a self-hosted Ubuntu machine:
 
 ```bash
 sudo systemctl {status,restart} portfolio-api portfolio-bot portfolio-dashboard
 journalctl -u portfolio-api -f
 ```
 
-- **Networking:** uvicorn on `127.0.0.1:8000`, Next.js on `127.0.0.1:3000`, exposed via **Tailscale Funnel** (443 for dashboard, 8443 for API) with automatic HTTPS certs.
+- **Networking:** uvicorn on `127.0.0.1:8000`, Next.js on `127.0.0.1:3000`, exposed via Tailscale Funnel (443 for the dashboard, 8443 for the API) with automatic HTTPS certificates.
 - **Scheduling:** cron drives `agent.py`, `alerts.py`, and `self_heal.py`.
-- **Deploy flow:** edit local mirror, rsync to server (excluding `venv`, `node_modules`, `.next`, `__pycache__`, logs), run `npm run build` for the dashboard, then restart services.
+- **Deploy flow:** edit the local mirror, rsync to the server (excluding `venv`, `node_modules`, `.next`, `__pycache__`, and logs), run `npm run build` for the dashboard, then restart the services.
 
 ---
 
-## Design notes & engineering lessons
+## Engineering notes
 
-A few things I'm proud of, and problems I solved building it:
+Selected implementation details:
 
-- **Rate-limit-aware prompt budgeting.** Groq enforces a per-minute token cap. The synthesis agent is the only one combining all five reports, so it truncates its inputs to stay under the limit, while carefully preserving the appended *decision memory* that a naive head-slice would drop.
-- **Retry/backoff for a flaky network.** The box's WiFi has a periodic roam gap, so LLM and data calls retry with `2/8/30s` backoff on both rate-limit *and* connection errors, but fail fast on a non-retryable "prompt too large" 413 instead of pointlessly retrying.
-- **IPv4 pinning.** yfinance (and GitHub) would silently return empty results because the box's IPv6 route is blackholed; the fix forces IPv4 for those hosts.
-- **Honest quant.** Metrics explicitly flag partial data (e.g. `total_return_partial`) rather than confidently reporting a number computed from missing sale prices.
-- **Self-healing.** `agent_runs` records every run's lifecycle so a hung "running" row (no `finished_at`) can be detected and the digest re-triggered.
-- **Security boundaries.** The Finnhub key never reaches the browser; the Telegram file URL (which embeds the bot token) is never sent to any third-party API; the API is GET-only, CORS-locked to the dashboard origin, and rate-limited per IP.
+- **Rate-limit-aware prompt budgeting.** Groq enforces a per-minute token cap. The synthesis agent combines all five reports, so it truncates its inputs to stay under the limit while preserving the appended decision memory that a naive head-slice would otherwise drop.
+- **Retry and backoff for unreliable networks.** LLM and data calls retry with `2/8/30s` backoff on both rate-limit and connection errors, but fail fast on a non-retryable 413 ("prompt too large") rather than retrying an identical request.
+- **IPv4 pinning.** yfinance and GitHub returned empty results because the host's IPv6 route was unreachable; the fix forces IPv4 for those hosts.
+- **Honest metrics.** Quant results explicitly flag partial data (for example, `total_return_partial`) rather than reporting figures computed from missing values.
+- **Self-healing.** `agent_runs` records each run's lifecycle, so a hung "running" row (no `finished_at`) can be detected and the digest re-triggered.
+- **Security boundaries.** The Finnhub key never reaches the browser; the Telegram file URL (which embeds the bot token) is never sent to a third-party API; the API is read-only, CORS-restricted to the dashboard origin, and rate-limited per IP.
 
 ---
 
 ## Disclaimer
 
-PortfolioAgent is a personal educational project. Nothing it produces is financial advice; it's an experiment in agentic AI applied to my own money. Do your own research.
+PortfolioAgent is a personal educational project. Its output is not financial advice. Conduct your own research before making investment decisions.
