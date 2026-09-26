@@ -12,7 +12,14 @@ from datetime import datetime
 
 import pytz
 
-from portfolio import get_conn, get_finnhub_quote, get_holdings, is_market_open
+from portfolio import (
+    get_conn,
+    get_finnhub_quote,
+    get_holdings,
+    is_market_open,
+    get_alert_threshold,
+    set_alert_threshold,
+)
 from tg_helpers import send_message
 
 logging.basicConfig(
@@ -24,6 +31,15 @@ log = logging.getLogger("alerts")
 
 ET = pytz.timezone("America/New_York")
 STEP_PCT = 3.0  # alert every 3% band crossed (3%, 6%, 9%, ...)
+
+# --- Allocation drift ---
+# Target split: 50% VOO / 30% QQQM / 20% individual names. Everything that
+# isn't VOO or QQQM is summed into the "individuals" bucket.
+TARGETS = {"VOO": 50, "QQQM": 30, "individuals": 20}
+# Deadband: a bucket must be more than ALLOC_STEP pts off target to alert, and
+# it re-alerts only when it crosses into the next ALLOC_STEP band (so a bucket
+# on target = drift 0 = band 0 = silent; worse drift re-alerts; no spam).
+ALLOC_STEP = 5
 
 
 def get_alerted_band(ticker):
@@ -93,8 +109,81 @@ def check_moves():
             set_alerted_band(ticker, band)
 
 
+def get_bucket_weights():
+    """Return {bucket: current % of portfolio} using live quotes.
+
+    Returns None if any quote is missing — better to skip a run than to alert
+    on a distorted allocation computed from incomplete prices.
+    """
+    values = {}
+    total = 0.0
+    for holding in get_holdings():
+        ticker = holding["ticker"]
+        quote = get_finnhub_quote(ticker)
+        if not quote:
+            return None
+        value = holding["shares"] * quote["current"]
+        total += value
+        bucket = ticker if ticker in ("VOO", "QQQM") else "individuals"
+        values[bucket] = values.get(bucket, 0.0) + value
+
+    if total == 0:
+        return None
+    return {bucket: value / total * 100 for bucket, value in values.items()}
+
+
+def check_allocation():
+    """Alert when a bucket drifts more than ALLOC_STEP pts from its target.
+
+    Same band/dedup mechanic as check_moves(), but keyed on drift-from-target
+    instead of daily price change, and without the daily reset — allocation
+    drift persists across days. A bucket re-alerts only when it worsens into a
+    new band; once it heals back inside the deadband its stored band resets to
+    0 so a future drift will alert again.
+    """
+    weights = get_bucket_weights()
+    if not weights:
+        log.info("Allocation check skipped: incomplete quote data.")
+        return
+
+    lines = []
+    fired = []  # (key, band) — recorded only after the send succeeds
+    for bucket, target in TARGETS.items():
+        current = weights.get(bucket, 0.0)
+        drift = current - target
+        band = int(drift / ALLOC_STEP)  # 0 while within +/- ALLOC_STEP pts (deadband)
+
+        key = f"alloc_{bucket}"
+        prev = get_alert_threshold(key)
+        prev_band = int(prev) if prev is not None else 0
+
+        if band == 0:
+            # Back within tolerance: reset so a future drift can re-alert.
+            if prev_band != 0:
+                set_alert_threshold(key, 0)
+            continue
+
+        moved_further = (band > 0 and band > prev_band) or (band < 0 and band < prev_band)
+        if not moved_further:
+            continue
+
+        side = "overweight" if drift > 0 else "underweight"
+        lines.append(f"{bucket}: {current:.1f}% vs {target}% target ({side} {drift:+.1f}pt)")
+        fired.append((key, band))
+        log.info(f"Alloc alert {bucket}: {current:.1f}% (band {prev_band} -> {band})")
+
+    if lines:
+        send_message(
+            "Allocation drift alert\n\nRebalance toward 50/30/20:\n" + "\n".join(lines),
+            disclaimer=False,
+        )
+        for key, band in fired:
+            set_alert_threshold(key, band)
+
+
 if __name__ == "__main__":
     if not is_market_open():
         log.info("Market closed, exiting.")
     else:
         check_moves()
+        check_allocation()
